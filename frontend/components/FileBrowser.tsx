@@ -14,28 +14,30 @@ const STAGE_COLORS: Record<string, string> = {
   unknown: "bg-gray-100 text-gray-600",
 };
 
-// Stage keywords ordered longest-first (same as backend STAGE_ORDER)
-const STAGE_KEYWORDS = [
-  "clean_incoherent",
-  "clean_cleaned",
-  "compare_and_identify_in_flow_and_db_different",
-  "compare_and_identify_in_flow_only",
-  "compare_and_identify_not_linked_mandatory",
-  "compare_and_identify_not_linked_optional",
-  "extract",
-  "transform",
-  "load",
-  "clean",
-  "compare",
-];
+/**
+ * Build a map from each blob name → its group prefix.
+ *
+ * Algorithm:
+ *  1. Collect the stems of all extract-stage blobs (full path without .csv).
+ *  2. For every blob, find the longest extract stem that is a prefix of its name.
+ *  3. If none matches, fall back to the blob's own stem.
+ *
+ * Example:
+ *   extract blob  → "flow/data/amt_owner.csv"  → stem "flow/data/amt_owner"
+ *   other blob    → "flow/data/amt_owner_clean_cleaned.csv" → matches stem → same group
+ */
+function buildGroupPrefixMap(allBlobs: BlobInfo[]): Map<string, string> {
+  const extractStems = allBlobs
+    .filter((b) => b.detected_stage === "extract")
+    .map((b) => b.name.replace(/\.csv$/i, ""))
+    .sort((a, b) => b.length - a.length); // longest first → most specific wins
 
-function extractSuffix(name: string, stage: string | null): string {
-  const stem = name.split("/").pop()?.replace(/\.csv$/i, "") ?? name;
-  if (!stage) return stem || "—";
-  const keyword = STAGE_KEYWORDS.find((k) => stem.toLowerCase().includes(k));
-  if (!keyword) return stem || "—";
-  const stripped = stem.replace(new RegExp(keyword, "i"), "").replace(/^[_\-.\s]+|[_\-.\s]+$/g, "");
-  return stripped || stem;
+  const map = new Map<string, string>();
+  for (const blob of allBlobs) {
+    const match = extractStems.find((stem) => blob.name.startsWith(stem));
+    map.set(blob.name, match ?? blob.name.replace(/\.csv$/i, ""));
+  }
+  return map;
 }
 
 function formatBytes(bytes: number): string {
@@ -97,18 +99,22 @@ export default function FileBrowser({
     });
   }, [blobs, search, stageFilter]);
 
+  // Build prefix map from ALL blobs so stage-filter doesn't break grouping
+  const groupPrefixMap = useMemo(() => buildGroupPrefixMap(blobs), [blobs]);
+
   const groups = useMemo((): BlobGroup[] => {
     const map = new Map<string, BlobGroup>();
 
     for (const blob of filtered) {
+      const prefix = groupPrefixMap.get(blob.name) ?? blob.name.replace(/\.csv$/i, "");
       const date = blob.last_modified ? blob.last_modified.slice(0, 10) : "unknown";
-      const suffix = extractSuffix(blob.name, blob.detected_stage);
-      const key = `${date}__${suffix}`;
+      const key = `${prefix}__${date}`;
+      const displayName = prefix.split("/").pop() ?? prefix;
 
       if (!map.has(key)) {
         map.set(key, {
-          key: { date, suffix },
-          label: suffix ? `${suffix}  ·  ${formatDate(blob.last_modified)}` : formatDate(blob.last_modified),
+          key: { date, suffix: prefix },
+          label: `${displayName}  ·  ${formatDate(blob.last_modified)}`,
           blobs: [],
         });
       }
@@ -116,11 +122,11 @@ export default function FileBrowser({
     }
 
     return Array.from(map.values()).sort((a, b) => {
-      // Sort by date descending, then suffix ascending
+      // Sort by date descending, then prefix ascending
       if (b.key.date !== a.key.date) return b.key.date.localeCompare(a.key.date);
       return a.key.suffix.localeCompare(b.key.suffix);
     });
-  }, [filtered]);
+  }, [filtered, groupPrefixMap]);
 
   const toggleOne = (name: string) => {
     const next = new Set(selected);
@@ -243,7 +249,9 @@ export default function FileBrowser({
                     className="flex items-center gap-2 text-left"
                   >
                     <span className="text-gray-400 text-xs">{isCollapsed ? "▶" : "▼"}</span>
-                    <span className="text-sm font-medium text-gray-700">{group.key.suffix || "—"}</span>
+                    <span className="text-sm font-medium text-gray-700">
+                      {group.key.suffix.split("/").pop() || "—"}
+                    </span>
                     <span className="text-xs text-gray-400">·</span>
                     <span className="text-xs text-gray-500">{formatDate(group.blobs[0].last_modified)}</span>
                   </button>
