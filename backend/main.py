@@ -98,6 +98,12 @@ class ColumnsRequest(BaseModel):
     blob_name: str
 
 
+class PreviewRequest(BaseModel):
+    container_url: str
+    blob_name: str
+    limit: int = 200
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -152,6 +158,25 @@ async def get_blob_columns(request: ColumnsRequest) -> List[str]:
         raw = blob_client.download_blob().readall()
         df = pd.read_csv(io.BytesIO(raw), nrows=0)
         return list(df.columns)
+    except AzureError as e:
+        raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/blobs/preview")
+async def preview_blob(request: PreviewRequest):
+    """Return the first N rows of a CSV blob as JSON."""
+    try:
+        client = build_container_client(request.container_url)
+        blob_client = client.get_blob_client(request.blob_name)
+        raw = blob_client.download_blob().readall()
+        df = pd.read_csv(io.BytesIO(raw), nrows=request.limit)
+        return {
+            "columns": list(df.columns),
+            "rows": df.where(pd.notna(df), None).to_dict(orient="records"),
+            "total_rows_loaded": len(df),
+        }
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
     except Exception as e:

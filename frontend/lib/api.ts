@@ -61,6 +61,29 @@ export async function listBlobs(
   return res.json();
 }
 
+export interface BlobPreview {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  total_rows_loaded: number;
+}
+
+export async function getBlobPreview(
+  containerUrl: string,
+  blobName: string,
+  limit = 200
+): Promise<BlobPreview> {
+  const res = await fetch(`${BASE_URL}/api/blobs/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ container_url: containerUrl, blob_name: blobName, limit }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to load preview");
+  }
+  return res.json();
+}
+
 export async function getBlobColumns(
   containerUrl: string,
   blobName: string
