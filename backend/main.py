@@ -16,14 +16,14 @@ from pydantic import BaseModel
 # Pipeline stage order (most specific names first for detection; order reflects pipeline flow)
 STAGE_ORDER = [
     "extract",
-    "transform",
     "clean_cleaned",
     "clean_incoherent",
-    "compare_identify_in_flow_only",
-    "compare_identify_in_flow_and_db_different",
-    "compare",
-    "clean",
+    "compare_and_identify_in_flow_only",
+    "compare_and_identify_in_flow_and_db_different",
+    "compare_and_identify_not_linked_mandatory",
+    "compare_and_identify_not_linked_optional",
     "load",
+    "transform",
 ]
 
 
@@ -33,10 +33,10 @@ def detect_stage(filename: str) -> Optional[str]:
     'clean_cleaned' before the specific variant does.
     """
     lower = filename.lower()
-    for stage in sorted(STAGE_ORDER, key=len, reverse=True):
+    for stage in STAGE_ORDER:
         if stage in lower:
             return stage
-    return None
+    return "extract"
 
 
 def build_container_client(container_url: str) -> ContainerClient:
