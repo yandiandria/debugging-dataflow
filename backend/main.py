@@ -174,7 +174,7 @@ async def preview_blob(request: PreviewRequest):
         df = pd.read_csv(io.BytesIO(raw), nrows=request.limit)
         return {
             "columns": list(df.columns),
-            "rows": df.where(pd.notna(df), None).to_dict(orient="records"),
+            "rows": json.loads(df.to_json(orient="records")),
             "total_rows_loaded": len(df),
         }
     except AzureError as e:
@@ -389,11 +389,9 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                     if matches.empty:
                         missing_stages.append(stage)
                     else:
-                        record = matches.iloc[0].to_dict()
-                        flow[stage] = {
-                            k: (None if pd.isna(v) else v)
-                            for k, v in record.items()
-                        }
+                        flow[stage] = json.loads(
+                            matches.iloc[[0]].to_json(orient="records")
+                        )[0]
                         last_seen_stage = stage
 
                 rows.append({
