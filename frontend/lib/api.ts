@@ -40,11 +40,19 @@ export interface LogEntry {
   timestamp: string; // ISO string set client-side
 }
 
-export async function listBlobs(containerUrl: string): Promise<BlobInfo[]> {
+export async function listBlobs(
+  containerUrl: string,
+  dateFrom?: string,
+  dateTo?: string
+): Promise<BlobInfo[]> {
   const res = await fetch(`${BASE_URL}/api/blobs/list`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ container_url: containerUrl }),
+    body: JSON.stringify({
+      container_url: containerUrl,
+      ...(dateFrom && { date_from: dateFrom }),
+      ...(dateTo && { date_to: dateTo }),
+    }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));

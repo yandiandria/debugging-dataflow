@@ -67,6 +67,8 @@ app.add_middleware(
 
 class BlobListRequest(BaseModel):
     container_url: str
+    date_from: Optional[str] = None  # ISO date string, e.g. "2024-01-15"
+    date_to: Optional[str] = None    # ISO date string, inclusive
 
 
 class BlobInfo(BaseModel):
@@ -105,18 +107,35 @@ async def health():
 
 @app.post("/api/blobs/list")
 async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
-    """List all CSV blobs in the container."""
+    """List all CSV blobs in the container, optionally filtered by last_modified date."""
+    from datetime import datetime, timezone
     try:
+        date_from = (
+            datetime.fromisoformat(request.date_from).replace(tzinfo=timezone.utc)
+            if request.date_from else None
+        )
+        date_to = (
+            datetime.fromisoformat(request.date_to).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+            if request.date_to else None
+        )
+
         client = build_container_client(request.container_url)
         blobs: List[BlobInfo] = []
         for blob in client.list_blobs():
-            if blob.name.lower().endswith(".csv"):
-                blobs.append(BlobInfo(
-                    name=blob.name,
-                    size=blob.size or 0,
-                    last_modified=blob.last_modified.isoformat() if blob.last_modified else "",
-                    detected_stage=detect_stage(blob.name),
-                ))
+            if not blob.name.lower().endswith(".csv"):
+                continue
+            lm = blob.last_modified
+            if lm:
+                if date_from and lm < date_from:
+                    continue
+                if date_to and lm > date_to:
+                    continue
+            blobs.append(BlobInfo(
+                name=blob.name,
+                size=blob.size or 0,
+                last_modified=lm.isoformat() if lm else "",
+                detected_stage=detect_stage(blob.name),
+            ))
         return blobs
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")

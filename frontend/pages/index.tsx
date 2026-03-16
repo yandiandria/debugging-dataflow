@@ -21,11 +21,11 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
 
   // ── Step 1: connect ────────────────────────────────────────────────────────
-  const handleConnect = async (url: string) => {
+  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await listBlobs(url);
+      const data = await listBlobs(url, dateFrom, dateTo);
       setContainerUrl(url);
       setBlobs(data);
       setSelected(new Set());
@@ -84,6 +84,15 @@ export default function Home() {
     setLogs([]);
     setError(null);
     setStep("connect");
+  };
+
+  // Keep the connection, just go back to file selection
+  const handleNewAnalysis = () => {
+    setSelected(new Set());
+    setResult(null);
+    setLogs([]);
+    setError(null);
+    setStep("browse");
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -153,7 +162,7 @@ export default function Home() {
         result={result}
         logs={logs}
         onBack={() => setStep("config")}
-        onReset={handleDisconnect}
+        onReset={handleNewAnalysis}
       />
     );
   }

@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 const STORAGE_KEY = "dataflow_container_url";
 
 interface Props {
-  onConnect: (containerUrl: string) => void;
+  onConnect: (containerUrl: string, dateFrom?: string, dateTo?: string) => void;
   loading: boolean;
   error: string | null;
 }
@@ -14,13 +14,15 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
       ? localStorage.getItem(STORAGE_KEY) ?? ""
       : ""
   );
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const url = containerUrl.trim();
     if (url) {
       localStorage.setItem(STORAGE_KEY, url);
-      onConnect(url);
+      onConnect(url, dateFrom || undefined, dateTo || undefined);
     }
   };
 
@@ -63,6 +65,35 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
                 </button>
               )}
             </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Filter by date <span className="text-gray-400 font-normal">(optional)</span>
+            </label>
+            <div className="flex gap-2">
+              <div className="flex-1">
+                <label className="block text-xs text-gray-500 mb-1">From</label>
+                <input
+                  type="date"
+                  className="w-full border border-gray-300 rounded-lg p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                />
+              </div>
+              <div className="flex-1">
+                <label className="block text-xs text-gray-500 mb-1">To</label>
+                <input
+                  type="date"
+                  className="w-full border border-gray-300 rounded-lg p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                />
+              </div>
+            </div>
+            <p className="text-xs text-gray-400 mt-1">
+              Only files modified within this range will be listed.
+            </p>
           </div>
 
           {error && (
