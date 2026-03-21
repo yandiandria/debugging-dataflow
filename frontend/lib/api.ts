@@ -179,6 +179,68 @@ export async function profileBlobs(
   return res.json();
 }
 
+export interface ProfileProgress {
+  current: number;
+  total: number;
+  blob_name: string;
+}
+
+/**
+ * Stream SSE events from /api/blobs/profile/stream.
+ * Calls onProgress for each blob starting, onProfile when a blob is done, onError on failure.
+ */
+export async function profileBlobsStream(
+  containerUrl: string,
+  blobNames: string[],
+  onProgress: (progress: ProfileProgress) => void,
+  onProfile: (profile: BlobProfile) => void,
+  onDone: () => void,
+  onError: (message: string) => void
+): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/blobs/profile/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ container_url: containerUrl, blob_names: blobNames }),
+  });
+
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    onError(err.detail || "Failed to profile blobs");
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "progress") {
+          onProgress(event as ProfileProgress);
+        } else if (event.type === "profile") {
+          onProfile(event.data as BlobProfile);
+        } else if (event.type === "done") {
+          onDone();
+        } else if (event.type === "error") {
+          onError(event.message);
+        }
+      } catch {
+        // malformed SSE line — ignore
+      }
+    }
+  }
+}
+
 /**
  * Stream SSE events from /api/analyze.
  * Calls onLog for each progress message, onResult when complete, onError on failure.

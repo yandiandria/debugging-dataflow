@@ -6,13 +6,27 @@ const STAGE_COLORS: Record<string, string> = {
   transform: "bg-blue-100 text-blue-700",
   clean_cleaned: "bg-teal-100 text-teal-700",
   clean_incoherent: "bg-rose-100 text-rose-700",
-  compare_identify_in_flow_only: "bg-indigo-100 text-indigo-700",
-  compare_identify_in_flow_and_db_different: "bg-violet-100 text-violet-700",
-  compare: "bg-yellow-100 text-yellow-700",
-  clean: "bg-cyan-100 text-cyan-700",
-  load: "bg-green-100 text-green-700",
+  compare_and_identify_in_flow_only: "bg-blue-100 text-blue-700",
+  compare_and_identify_in_flow_and_db_different: "bg-violet-100 text-violet-700",
+  compare_and_identify_not_linked_optional: "bg-yellow-100 text-yellow-700",
+  compare_and_identify_not_linked_mandatory: "bg-orange-100 text-orange-700",
   unknown: "bg-gray-100 text-gray-600",
 };
+
+const OVERRIDES_KEY = "dataflow-group-overrides";
+
+function loadOverrides(): Map<string, string> {
+  try {
+    const saved = localStorage.getItem(OVERRIDES_KEY);
+    return saved ? new Map(JSON.parse(saved)) : new Map();
+  } catch {
+    return new Map();
+  }
+}
+
+function saveOverrides(overrides: Map<string, string>) {
+  localStorage.setItem(OVERRIDES_KEY, JSON.stringify(Array.from(overrides.entries())));
+}
 
 /**
  * Build a map from each blob name → its group prefix (stem of the extract blob).
@@ -95,6 +109,7 @@ export default function FileBrowser({
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState<string>("all");
   const [resourceFilter, setResourceFilter] = useState<string>("all");
+  const [dateFilter, setDateFilter] = useState<string>("all");
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 
   // assign form state: key of the group being assigned
@@ -103,6 +118,11 @@ export default function FileBrowser({
   const [assignTechnical, setAssignTechnical] = useState("");
   const [assignExisting, setAssignExisting] = useState("");
   const [assignSaving, setAssignSaving] = useState(false);
+
+  // manual group override state
+  const [manualGroupOverrides, setManualGroupOverrides] = useState<Map<string, string>>(loadOverrides);
+  const [movingBlob, setMovingBlob] = useState<string | null>(null);
+  const [moveTargetPrefix, setMoveTargetPrefix] = useState("");
 
   const stages = useMemo(() => {
     const s = new Set(blobs.map((b) => b.detected_stage ?? "unknown"));
@@ -125,7 +145,14 @@ export default function FileBrowser({
     });
   }, [blobs, search, stageFilter]);
 
-  const groupPrefixMap = useMemo(() => buildGroupPrefixMap(blobs, resources), [blobs, resources]);
+  const groupPrefixMap = useMemo(() => {
+    const map = buildGroupPrefixMap(blobs, resources);
+    // Apply manual overrides on top of auto-detected prefixes
+    for (const [blobName, prefix] of manualGroupOverrides) {
+      if (map.has(blobName)) map.set(blobName, prefix);
+    }
+    return map;
+  }, [blobs, resources, manualGroupOverrides]);
 
   const allGroups = useMemo((): BlobGroup[] => {
     const map = new Map<string, BlobGroup>();
@@ -152,12 +179,49 @@ export default function FileBrowser({
     });
   }, [filtered, groupPrefixMap]);
 
+  // Available dates for the selected resource filter (ordered most recent first)
+  const availableDates = useMemo(() => {
+    if (resourceFilter === "all") return [];
+    const res = resources.find((r) => r.id === resourceFilter);
+    if (!res) return [];
+    const resourceGroups = allGroups.filter((g) => g.key.suffix === res.technical_name);
+    // Collect unique last_modified timestamps from matching blobs, ordered most recent first
+    const seen = new Set<string>();
+    const dates: { label: string; iso: string }[] = [];
+    for (const g of resourceGroups) {
+      for (const blob of g.blobs) {
+        const iso = blob.last_modified ?? "";
+        if (!iso || seen.has(iso)) continue;
+        seen.add(iso);
+        dates.push({ iso, label: new Date(iso).toLocaleString() });
+      }
+    }
+    dates.sort((a, b) => b.iso.localeCompare(a.iso));
+    return dates;
+  }, [allGroups, resourceFilter, resources]);
+
   const groups = useMemo(() => {
     if (resourceFilter === "all") return allGroups;
     const res = resources.find((r) => r.id === resourceFilter);
     if (!res) return allGroups;
-    return allGroups.filter((g) => g.key.suffix === res.technical_name);
-  }, [allGroups, resourceFilter, resources]);
+    let result = allGroups.filter((g) => g.key.suffix === res.technical_name);
+    if (dateFilter !== "all") {
+      result = result
+        .map((g) => ({
+          ...g,
+          blobs: g.blobs.filter((b) => b.last_modified === dateFilter),
+        }))
+        .filter((g) => g.blobs.length > 0);
+    }
+    return result;
+  }, [allGroups, resourceFilter, resources, dateFilter]);
+
+  // All unique prefixes available as move targets
+  const availablePrefixes = useMemo(() => {
+    const set = new Set<string>();
+    for (const g of allGroups) set.add(g.key.suffix);
+    return Array.from(set).sort();
+  }, [allGroups]);
 
   const toggleOne = (name: string) => {
     const next = new Set(selected);
@@ -237,6 +301,39 @@ export default function FileBrowser({
     }
   };
 
+  const moveToGroup = (blobName: string, targetPrefix: string) => {
+    const next = new Map(manualGroupOverrides);
+    next.set(blobName, targetPrefix);
+    setManualGroupOverrides(next);
+    saveOverrides(next);
+    setMovingBlob(null);
+    setMoveTargetPrefix("");
+  };
+
+  const resetGroupOverride = (blobName: string) => {
+    const next = new Map(manualGroupOverrides);
+    next.delete(blobName);
+    setManualGroupOverrides(next);
+    saveOverrides(next);
+  };
+
+  const startMoveBlob = (e: React.MouseEvent, blobName: string, currentPrefix: string) => {
+    e.stopPropagation();
+    setMovingBlob(blobName);
+    setMoveTargetPrefix(currentPrefix);
+  };
+
+  const cancelMove = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMovingBlob(null);
+    setMoveTargetPrefix("");
+  };
+
+  const confirmMove = (e: React.MouseEvent, blobName: string) => {
+    e.stopPropagation();
+    if (moveTargetPrefix) moveToGroup(blobName, moveTargetPrefix);
+  };
+
   const visibleBlobs = groups.flatMap((g) => g.blobs);
   const allFilteredSelected =
     visibleBlobs.length > 0 && visibleBlobs.every((b) => selected.has(b.name));
@@ -264,7 +361,7 @@ export default function FileBrowser({
           </select>
           <select
             value={resourceFilter}
-            onChange={(e) => setResourceFilter(e.target.value)}
+            onChange={(e) => { setResourceFilter(e.target.value); setDateFilter("all"); }}
             className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             <option value="all">All resources</option>
@@ -272,6 +369,18 @@ export default function FileBrowser({
               <option key={r.id} value={r.id}>{r.business_name}</option>
             ))}
           </select>
+          {resourceFilter !== "all" && availableDates.length > 0 && (
+            <select
+              value={dateFilter}
+              onChange={(e) => setDateFilter(e.target.value)}
+              className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <option value="all">All dates</option>
+              {availableDates.map((d) => (
+                <option key={d.iso} value={d.iso}>{d.label}</option>
+              ))}
+            </select>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -444,11 +553,15 @@ export default function FileBrowser({
                     {group.blobs.map((blob) => {
                       const stage = blob.detected_stage ?? "unknown";
                       const isSelected = selected.has(blob.name);
+                      const isMoving = movingBlob === blob.name;
+                      const hasOverride = manualGroupOverrides.has(blob.name);
+                      const currentPrefix = groupPrefixMap.get(blob.name) ?? "";
+
                       return (
                         <tr
                           key={blob.name}
-                          onClick={() => toggleOne(blob.name)}
-                          className={`border-t border-gray-100 cursor-pointer hover:bg-blue-50 transition-colors ${isSelected ? "bg-blue-50" : ""}`}
+                          onClick={() => !isMoving && toggleOne(blob.name)}
+                          className={`group/row border-t border-gray-100 cursor-pointer hover:bg-blue-50 transition-colors ${isSelected ? "bg-blue-50" : ""} ${isMoving ? "bg-amber-50" : ""}`}
                         >
                           <td className="px-4 py-2.5 w-8">
                             <input
@@ -460,7 +573,15 @@ export default function FileBrowser({
                             />
                           </td>
                           <td className="px-3 py-2.5 font-mono text-xs text-gray-800 break-all">
-                            {blob.name}
+                            <span className="flex items-center gap-1.5">
+                              {blob.name}
+                              {hasOverride && (
+                                <span
+                                  className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"
+                                  title="Manually assigned to this group"
+                                />
+                              )}
+                            </span>
                           </td>
                           <td className="px-3 py-2.5 whitespace-nowrap">
                             <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${STAGE_COLORS[stage] ?? STAGE_COLORS.unknown}`}>
@@ -472,6 +593,57 @@ export default function FileBrowser({
                           </td>
                           <td className="px-3 py-2.5 text-gray-500 text-xs whitespace-nowrap">
                             {blob.last_modified ? new Date(blob.last_modified).toLocaleString() : "—"}
+                          </td>
+                          {/* Move to group column */}
+                          <td className="px-3 py-2.5 w-56" onClick={(e) => e.stopPropagation()}>
+                            {isMoving ? (
+                              <div className="flex items-center gap-1">
+                                <select
+                                  value={moveTargetPrefix}
+                                  onChange={(e) => setMoveTargetPrefix(e.target.value)}
+                                  className="border border-amber-300 rounded px-1.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-amber-400 flex-1 min-w-0"
+                                  autoFocus
+                                >
+                                  {availablePrefixes.map((p) => (
+                                    <option key={p} value={p}>
+                                      {p === currentPrefix ? `${p.split("/").pop()} (current)` : p.split("/").pop()}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  onClick={(e) => confirmMove(e, blob.name)}
+                                  disabled={!moveTargetPrefix || moveTargetPrefix === currentPrefix}
+                                  className="px-1.5 py-1 text-xs bg-amber-500 hover:bg-amber-600 disabled:bg-amber-200 text-white rounded transition-colors flex-shrink-0"
+                                  title="Confirm move"
+                                >
+                                  ✓
+                                </button>
+                                {hasOverride && (
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); resetGroupOverride(blob.name); setMovingBlob(null); }}
+                                    className="px-1.5 py-1 text-xs text-gray-500 hover:text-gray-700 border border-gray-200 rounded transition-colors flex-shrink-0"
+                                    title="Reset to auto-detected group"
+                                  >
+                                    ↺
+                                  </button>
+                                )}
+                                <button
+                                  onClick={cancelMove}
+                                  className="px-1.5 py-1 text-xs text-gray-400 hover:text-gray-600 flex-shrink-0"
+                                  title="Cancel"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={(e) => startMoveBlob(e, blob.name, currentPrefix)}
+                                className="opacity-0 group-hover/row:opacity-100 text-xs text-gray-400 hover:text-amber-600 border border-gray-200 hover:border-amber-300 rounded px-2 py-0.5 transition-all"
+                                title="Move to a different group"
+                              >
+                                move →
+                              </button>
+                            )}
                           </td>
                         </tr>
                       );
@@ -489,6 +661,11 @@ export default function FileBrowser({
         <div className="mt-3 flex items-center justify-between text-xs text-gray-400">
           <span>
             {groups.length} group{groups.length !== 1 ? "s" : ""} · {visibleBlobs.length} file{visibleBlobs.length !== 1 ? "s" : ""}
+            {manualGroupOverrides.size > 0 && (
+              <span className="ml-2 text-amber-500">
+                · {manualGroupOverrides.size} manual override{manualGroupOverrides.size !== 1 ? "s" : ""}
+              </span>
+            )}
           </span>
           <button onClick={toggleAll} className="hover:text-gray-600 transition-colors">
             {allFilteredSelected ? "Deselect all" : "Select all"}

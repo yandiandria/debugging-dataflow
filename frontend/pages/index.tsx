@@ -14,7 +14,7 @@ import {
   createResource,
   updateResource,
   deleteResource,
-  profileBlobs,
+  profileBlobsStream,
 } from "../lib/api";
 import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
@@ -114,31 +114,61 @@ export default function Home() {
     setVolumetryData((prev) => ({
       ...prev,
       [resourceId]: {
-        ...(prev[resourceId] ?? { profiles: [] }),
+        profiles: [],
         status: "loading",
       },
     }));
 
-    try {
-      const profiles = await profileBlobs(containerUrl, matchingBlobNames);
-      setVolumetryData((prev) => ({
-        ...prev,
-        [resourceId]: {
-          status: "loaded",
-          profiles,
-          lastUpdated: new Date().toISOString(),
-        },
-      }));
-    } catch (e: unknown) {
-      setVolumetryData((prev) => ({
-        ...prev,
-        [resourceId]: {
-          status: "error",
-          profiles: prev[resourceId]?.profiles ?? [],
-          error: e instanceof Error ? e.message : "Failed to profile",
-        },
-      }));
-    }
+    await profileBlobsStream(
+      containerUrl,
+      matchingBlobNames,
+      (progress) => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [resourceId]: {
+            ...prev[resourceId],
+            status: "loading",
+            progress: {
+              current: progress.current,
+              total: progress.total,
+              currentBlob: progress.blob_name,
+            },
+          },
+        }));
+      },
+      (profile) => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [resourceId]: {
+            ...prev[resourceId],
+            status: "loading",
+            profiles: [...(prev[resourceId]?.profiles ?? []), profile],
+          },
+        }));
+      },
+      () => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [resourceId]: {
+            ...prev[resourceId],
+            status: "loaded",
+            progress: undefined,
+            lastUpdated: new Date().toISOString(),
+          },
+        }));
+      },
+      (message) => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [resourceId]: {
+            status: "error",
+            profiles: prev[resourceId]?.profiles ?? [],
+            error: message,
+            progress: undefined,
+          },
+        }));
+      },
+    );
   };
 
   // ── Resets ─────────────────────────────────────────────────────────────────

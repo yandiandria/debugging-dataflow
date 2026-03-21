@@ -9,7 +9,6 @@ const STAGE_ORDER = [
   "compare_and_identify_in_flow_and_db_different",
   "compare_and_identify_not_linked_mandatory",
   "compare_and_identify_not_linked_optional",
-  "load",
   "transform",
 ];
 
@@ -18,6 +17,11 @@ export interface VolumetryEntry {
   profiles: BlobProfile[];
   error?: string;
   lastUpdated?: string;
+  progress?: {
+    current: number;
+    total: number;
+    currentBlob?: string;
+  };
 }
 
 interface Props {
@@ -72,7 +76,7 @@ export default function VolumetryPanel({
       <button
         onClick={onToggle}
         className={`fixed top-1/2 -translate-y-1/2 z-50 bg-white border border-gray-200 shadow-md px-1.5 py-4 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-50 transition-all duration-300 rounded-l-lg ${
-          open ? "right-80" : "right-0"
+          open ? "right-[50vw]" : "right-0"
         }`}
         style={{ writingMode: "vertical-rl", textOrientation: "mixed" }}
       >
@@ -81,7 +85,7 @@ export default function VolumetryPanel({
 
       {/* Sliding panel */}
       <div
-        className={`fixed top-0 right-0 h-screen w-80 bg-white border-l border-gray-200 shadow-xl z-40 flex flex-col transition-transform duration-300 ${
+        className={`fixed top-0 right-0 h-screen w-[50vw] bg-white border-l border-gray-200 shadow-xl z-40 flex flex-col transition-transform duration-300 ${
           open ? "translate-x-0" : "translate-x-full"
         }`}
       >
@@ -109,7 +113,9 @@ export default function VolumetryPanel({
                 const isLoading = entry?.status === "loading";
                 const isLoaded = entry?.status === "loaded";
                 const hasError = entry?.status === "error";
-                const stageGroups = isLoaded ? groupProfilesByStage(entry.profiles) : [];
+                const stageGroups = (isLoaded || isLoading) && entry?.profiles.length
+                  ? groupProfilesByStage(entry.profiles)
+                  : [];
 
                 return (
                   <div key={resource.id} className="p-3">
@@ -149,7 +155,30 @@ export default function VolumetryPanel({
                       <p className="text-xs text-red-500">{entry.error}</p>
                     )}
                     {isLoading && (
-                      <p className="text-xs text-gray-400 animate-pulse">Profiling {matchingBlobs.length} file(s)…</p>
+                      <div className="space-y-1.5">
+                        {entry.progress ? (
+                          <>
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1 bg-gray-200 rounded-full h-1.5 overflow-hidden">
+                                <div
+                                  className="bg-indigo-500 h-full rounded-full transition-all duration-300"
+                                  style={{ width: `${(entry.progress.current / entry.progress.total) * 100}%` }}
+                                />
+                              </div>
+                              <span className="text-xs text-gray-500 tabular-nums flex-shrink-0">
+                                {entry.progress.current}/{entry.progress.total}
+                              </span>
+                            </div>
+                            {entry.progress.currentBlob && (
+                              <p className="text-xs text-gray-400 font-mono truncate" title={entry.progress.currentBlob}>
+                                {entry.progress.currentBlob.split("/").pop()}
+                              </p>
+                            )}
+                          </>
+                        ) : (
+                          <p className="text-xs text-gray-400 animate-pulse">Starting…</p>
+                        )}
+                      </div>
                     )}
                     {isLoaded && entry.lastUpdated && (
                       <p className="text-xs text-gray-300 mb-1.5">
@@ -158,7 +187,7 @@ export default function VolumetryPanel({
                     )}
 
                     {/* Stage groups */}
-                    {isLoaded && stageGroups.length > 0 && (
+                    {stageGroups.length > 0 && (
                       <div className="space-y-3 mt-1">
                         {stageGroups.map((group, gi) => {
                           const prevGroup = gi > 0 ? stageGroups[gi - 1] : null;

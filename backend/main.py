@@ -25,7 +25,6 @@ STAGE_ORDER = [
     "compare_and_identify_in_flow_and_db_different",
     "compare_and_identify_not_linked_mandatory",
     "compare_and_identify_not_linked_optional",
-    "load",
     "transform",
 ]
 
@@ -307,6 +306,75 @@ async def profile_blobs(request: ProfileRequest) -> List[Dict]:
                 "error": str(e),
             })
     return results
+
+
+@app.post("/api/blobs/profile/stream")
+async def profile_blobs_stream(request: ProfileRequest) -> StreamingResponse:
+    """Stream SSE events while profiling blobs one by one."""
+
+    async def generate() -> AsyncGenerator[str, None]:
+        try:
+            client = build_container_client(request.container_url)
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+            return
+
+        total = len(request.blob_names)
+        for i, blob_name in enumerate(request.blob_names):
+            yield _sse({
+                "type": "progress",
+                "current": i + 1,
+                "total": total,
+                "blob_name": blob_name,
+            })
+            try:
+                raw = client.get_blob_client(blob_name).download_blob().readall()
+                df = pd.read_csv(io.BytesIO(raw))
+
+                col_profiles = []
+                for col in df.columns:
+                    distinct = int(df[col].nunique(dropna=False))
+                    vc = None
+                    if distinct < 10:
+                        series = df[col].value_counts(dropna=False)
+                        vc = {}
+                        for k, v in series.items():
+                            key = "null" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
+                            vc[key] = int(v)
+                    col_profiles.append({
+                        "name": col,
+                        "distinct_count": distinct,
+                        "value_counts": vc,
+                    })
+
+                yield _sse({
+                    "type": "profile",
+                    "data": {
+                        "blob_name": blob_name,
+                        "detected_stage": detect_stage(blob_name) or "unknown",
+                        "row_count": len(df),
+                        "columns": col_profiles,
+                    },
+                })
+            except Exception as e:
+                yield _sse({
+                    "type": "profile",
+                    "data": {
+                        "blob_name": blob_name,
+                        "detected_stage": detect_stage(blob_name) or "unknown",
+                        "row_count": -1,
+                        "columns": [],
+                        "error": str(e),
+                    },
+                })
+
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _apply_single_filter(df: pd.DataFrame, f: FilterCondition) -> pd.DataFrame:
