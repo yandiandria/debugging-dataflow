@@ -6,6 +6,9 @@ import FlowResults from "../components/FlowResults";
 import LogPanel from "../components/LogPanel";
 import ResourceManager from "../components/ResourceManager";
 import VolumetryPanel from "../components/VolumetryPanel";
+import DAGManager from "../components/DAGManager";
+import IntegrationRuleManager from "../components/IntegrationRuleManager";
+import ResourceDashboard from "../components/ResourceDashboard";
 import type { VolumetryEntry } from "../components/VolumetryPanel";
 import {
   listBlobs,
@@ -18,7 +21,7 @@ import {
 } from "../lib/api";
 import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
-type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources";
+type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard";
 
 export default function Home() {
   const [step, setStep] = useState<Step>("connect");
@@ -207,16 +210,51 @@ export default function Home() {
         onBack={() => setStep("browse")}
       />
     );
+  } else if (step === "dags") {
+    content = <DAGManager onBack={() => setStep("browse")} />;
+  } else if (step === "rules") {
+    content = <IntegrationRuleManager resources={resources} onBack={() => setStep("browse")} />;
+  } else if (step === "dashboard") {
+    content = (
+      <ResourceDashboard
+        resources={resources}
+        blobs={blobs}
+        containerUrl={containerUrl}
+        onBack={() => setStep("browse")}
+      />
+    );
   } else if (step === "browse") {
     content = (
       <div className="min-h-screen bg-gray-50 p-6">
         <div className="max-w-screen-xl mx-auto">
-          <div className="mb-4">
-            <h1 className="text-2xl font-bold text-gray-800">Data Flow Debugger</h1>
-            <p className="text-sm text-gray-500">
-              {blobs.length} CSV file{blobs.length !== 1 ? "s" : ""} found · Select the
-              files you want to trace across pipeline stages
-            </p>
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-800">Data Flow Debugger</h1>
+              <p className="text-sm text-gray-500">
+                {blobs.length} CSV file{blobs.length !== 1 ? "s" : ""} found · Select the
+                files you want to trace across pipeline stages
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setStep("dashboard")}
+                className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Dashboard
+              </button>
+              <button
+                onClick={() => setStep("dags")}
+                className="text-sm bg-gray-600 hover:bg-gray-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                DAGs
+              </button>
+              <button
+                onClick={() => setStep("rules")}
+                className="text-sm bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Rules
+              </button>
+            </div>
           </div>
           <FileBrowser
             blobs={blobs}
@@ -248,7 +286,7 @@ export default function Home() {
         <div className="w-full max-w-2xl">
           <div className="flex items-center gap-3 mb-4">
             <div className="w-3 h-3 rounded-full bg-blue-500 animate-pulse" />
-            <h2 className="text-white font-semibold text-lg">Analyzing pipeline…</h2>
+            <h2 className="text-white font-semibold text-lg">Analyzing pipeline...</h2>
           </div>
           <LogPanel entries={logs} running={true} />
           <p className="text-gray-600 text-xs mt-3 text-center">

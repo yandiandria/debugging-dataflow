@@ -16,25 +16,100 @@ interface EditState {
   business_name: string;
 }
 
+const GAP_MINUTES = 15;
+
+/**
+ * Given a list of blobs, find the start of the most recent "batch":
+ * sort by last_modified, walk backwards, and when the gap between two
+ * consecutive files exceeds GAP_MINUTES, the later file is the batch boundary.
+ * Returns the ISO string of that boundary, or "" if no gap found.
+ */
+function detectBatchStart(matchingBlobs: BlobInfo[]): string {
+  const sorted = matchingBlobs
+    .filter((b) => b.last_modified)
+    .sort((a, b) => (a.last_modified ?? "").localeCompare(b.last_modified ?? ""));
+
+  if (sorted.length < 2) return "";
+
+  let lastGapIndex = -1;
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = new Date(sorted[i - 1].last_modified).getTime();
+    const curr = new Date(sorted[i].last_modified).getTime();
+    if ((curr - prev) / (1000 * 60) > GAP_MINUTES) {
+      lastGapIndex = i;
+    }
+  }
+
+  return lastGapIndex >= 0 ? sorted[lastGapIndex].last_modified : "";
+}
+
+interface ValidationResult {
+  valid: boolean;
+  issues: string[];
+}
+
+function validateBatch(filteredBlobs: BlobInfo[]): ValidationResult {
+  const stageCounts: Record<string, number> = {};
+  for (const b of filteredBlobs) {
+    const stage = b.detected_stage ?? "unknown";
+    stageCounts[stage] = (stageCounts[stage] ?? 0) + 1;
+  }
+
+  const issues: string[] = [];
+
+  if (!stageCounts["extract"] || stageCounts["extract"] < 1) {
+    issues.push("missing extract");
+  }
+  if (!stageCounts["transform"] || stageCounts["transform"] < 1) {
+    issues.push("missing transform");
+  }
+
+  for (const [stage, count] of Object.entries(stageCounts)) {
+    if (stage === "extract" || stage === "transform") continue;
+    if (count !== 1) {
+      issues.push(`${stage}: ${count} (expected 1)`);
+    }
+  }
+
+  return { valid: issues.length === 0, issues };
+}
+
 export default function ResourceManager({ resources, blobs, onCreate, onUpdate, onDelete, onBack }: Props) {
   const [editState, setEditState] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // New resource form state ("new" is a sentinel id)
   const [showNew, setShowNew] = useState(false);
   const [newTechnical, setNewTechnical] = useState("");
   const [newBusiness, setNewBusiness] = useState("");
 
-  // Date filter per resource
-  const [dateFilters, setDateFilters] = useState<Record<string, string>>({});
+  // Manual date override per resource (undefined = use auto, "" = all dates)
+  const [dateOverrides, setDateOverrides] = useState<Record<string, string>>({});
 
-  // Build available dates per resource (sorted most recent first)
+  // Matching blobs per resource (unfiltered)
+  const matchingBlobsByResource = useMemo(() => {
+    const result: Record<string, BlobInfo[]> = {};
+    for (const r of resources) {
+      result[r.id] = blobs.filter((b) => b.name.startsWith(r.technical_name));
+    }
+    return result;
+  }, [resources, blobs]);
+
+  // Auto-detected batch start per resource
+  const autoDateByResource = useMemo(() => {
+    const result: Record<string, string> = {};
+    for (const r of resources) {
+      result[r.id] = detectBatchStart(matchingBlobsByResource[r.id] ?? []);
+    }
+    return result;
+  }, [resources, matchingBlobsByResource]);
+
+  // Available dates per resource (sorted most recent first)
   const datesByResource = useMemo(() => {
     const result: Record<string, { iso: string; label: string }[]> = {};
     for (const r of resources) {
-      const matching = blobs.filter((b) => b.name.startsWith(r.technical_name));
+      const matching = matchingBlobsByResource[r.id] ?? [];
       const seen = new Set<string>();
       const dates: { iso: string; label: string }[] = [];
       for (const b of matching) {
@@ -47,20 +122,36 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
       result[r.id] = dates;
     }
     return result;
-  }, [resources, blobs]);
+  }, [resources, matchingBlobsByResource]);
 
-  // Filtered blobs per resource (keep files with last_modified >= selected date)
+  // Effective filter: auto unless manually overridden
+  const effectiveFilter = (resourceId: string): string => {
+    if (resourceId in dateOverrides) return dateOverrides[resourceId];
+    return autoDateByResource[resourceId] ?? "";
+  };
+
+  // Filtered blobs per resource (>= effective filter date)
   const filteredBlobsByResource = useMemo(() => {
     const result: Record<string, BlobInfo[]> = {};
     for (const r of resources) {
-      const matching = blobs.filter((b) => b.name.startsWith(r.technical_name));
-      const dateFilter = dateFilters[r.id];
-      result[r.id] = dateFilter
-        ? matching.filter((b) => (b.last_modified ?? "") >= dateFilter)
+      const matching = matchingBlobsByResource[r.id] ?? [];
+      const filter = effectiveFilter(r.id);
+      result[r.id] = filter
+        ? matching.filter((b) => (b.last_modified ?? "") >= filter)
         : matching;
     }
     return result;
-  }, [resources, blobs, dateFilters]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resources, matchingBlobsByResource, autoDateByResource, dateOverrides]);
+
+  // Validation per resource
+  const validationByResource = useMemo(() => {
+    const result: Record<string, ValidationResult> = {};
+    for (const r of resources) {
+      result[r.id] = validateBatch(filteredBlobsByResource[r.id] ?? []);
+    }
+    return result;
+  }, [resources, filteredBlobsByResource]);
 
   const startEdit = (r: Resource) => {
     setEditState({ id: r.id, technical_name: r.technical_name, business_name: r.business_name });
@@ -199,7 +290,11 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
             const isDeleting = deletingId === r.id;
             const dates = datesByResource[r.id] ?? [];
             const filteredBlobs = filteredBlobsByResource[r.id] ?? [];
-            const currentDateFilter = dateFilters[r.id] ?? "";
+            const autoDate = autoDateByResource[r.id] ?? "";
+            const isManual = r.id in dateOverrides;
+            const currentFilter = effectiveFilter(r.id);
+            const validation = validationByResource[r.id];
+
             return (
               <div key={r.id} className={`border-b border-gray-100 last:border-b-0 ${isEditing ? "bg-blue-50" : ""}`}>
                 <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-3 items-center">
@@ -259,15 +354,29 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
                   )}
                 </div>
 
-                {/* Date filter + matching files */}
+                {/* Date filter */}
                 {!isEditing && dates.length > 0 && (
-                  <div className="px-4 pb-3 flex items-center gap-3">
+                  <div className="px-4 pb-2 flex items-center gap-3 flex-wrap">
                     <select
-                      value={currentDateFilter}
-                      onChange={(e) => setDateFilters((prev) => ({ ...prev, [r.id]: e.target.value }))}
+                      value={isManual ? currentFilter : "__auto__"}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === "__auto__") {
+                          setDateOverrides((prev) => {
+                            const next = { ...prev };
+                            delete next[r.id];
+                            return next;
+                          });
+                        } else {
+                          setDateOverrides((prev) => ({ ...prev, [r.id]: val }));
+                        }
+                      }}
                       className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-400"
                     >
-                      <option value="">All dates ({dates.length})</option>
+                      <option value="__auto__">
+                        Auto{autoDate ? ` (${new Date(autoDate).toLocaleString()})` : ""}
+                      </option>
+                      <option value="">All dates</option>
                       {dates.map((d) => (
                         <option key={d.iso} value={d.iso}>{d.label}</option>
                       ))}
@@ -275,6 +384,19 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
                     <span className="text-xs text-gray-400">
                       {filteredBlobs.length} file{filteredBlobs.length !== 1 ? "s" : ""}
                     </span>
+                    {/* Validation badge */}
+                    {validation.valid ? (
+                      <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-medium">
+                        OK
+                      </span>
+                    ) : (
+                      <span
+                        className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-600 font-medium cursor-help"
+                        title={validation.issues.join(", ")}
+                      >
+                        {validation.issues.length} issue{validation.issues.length !== 1 ? "s" : ""}
+                      </span>
+                    )}
                   </div>
                 )}
 
@@ -290,14 +412,24 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
                         }, {})
                       )
                         .sort(([a], [b]) => a.localeCompare(b))
-                        .map(([stage, count]) => (
-                          <span
-                            key={stage}
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-gray-100 text-gray-600"
-                          >
-                            <span className="font-medium">{count}</span> {stage}
-                          </span>
-                        ))}
+                        .map(([stage, count]) => {
+                          const isOk =
+                            (stage === "extract" || stage === "transform")
+                              ? count >= 1
+                              : count === 1;
+                          return (
+                            <span
+                              key={stage}
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${
+                                isOk
+                                  ? "bg-gray-100 text-gray-600"
+                                  : "bg-red-50 text-red-600"
+                              }`}
+                            >
+                              <span className="font-medium">{count}</span> {stage}
+                            </span>
+                          );
+                        })}
                     </div>
                   </div>
                 )}

@@ -1,0 +1,644 @@
+import { useState, useEffect, useCallback, useMemo } from "react";
+import LogPanel from "./LogPanel";
+import type { VolumetryEntry } from "./VolumetryPanel";
+import type {
+  Resource, DAG, DAGConfig, DAGRun, IntegrationRule, MappingIssue, QAExampleID,
+  BlobInfo, LogEntry,
+} from "../lib/api";
+import {
+  getDags, getDagConfig, getDagRuns,
+  getRules, updateRule,
+  getMappingIssues, saveMappingIssues, resolveMappingIssue,
+  getQAExamples, createQAExample, deleteQAExample,
+  getIdColumns, getColumnValues,
+  triggerDagStream, fetchDagLogsStream,
+  linkResourceDags,
+  profileBlobsStream,
+} from "../lib/api";
+
+interface Props {
+  resources: Resource[];
+  blobs: BlobInfo[];
+  containerUrl: string;
+  onBack: () => void;
+}
+
+export default function ResourceDashboard({ resources, blobs, containerUrl, onBack }: Props) {
+  // Selection
+  const [selectedResourceId, setSelectedResourceId] = useState<string>(resources[0]?.id ?? "");
+  const [selectedEnv, setSelectedEnv] = useState("dev");
+
+  // Data
+  const [dags, setDags] = useState<DAG[]>([]);
+  const [dagConfig, setDagConfig] = useState<DAGConfig>({ container_name: "", environments: ["integration", "snap", "recette", "prod"] });
+  const [dagRuns, setDagRuns] = useState<DAGRun[]>([]);
+  const [rules, setRules] = useState<IntegrationRule[]>([]);
+  const [mappingIssues, setMappingIssues] = useState<MappingIssue[]>([]);
+  const [qaExamples, setQAExamples] = useState<QAExampleID[]>([]);
+
+  // Resource-specific DAG linking
+  const [resourceDagIds, setResourceDagIds] = useState<string[]>([]);
+  const [linkingDags, setLinkingDags] = useState(false);
+  const [showDagLinkDropdown, setShowDagLinkDropdown] = useState(false);
+
+  // DAG runner
+  const [dagLogs, setDagLogs] = useState<LogEntry[]>([]);
+  const [runningDagId, setRunningDagId] = useState<string | null>(null);
+
+  // Volumetry
+  const [volumetryData, setVolumetryData] = useState<Record<string, VolumetryEntry>>({});
+
+  // QA Example form
+  const [idColumns, setIdColumns] = useState<string[]>([]);
+  const [selectedIdColumn, setSelectedIdColumn] = useState("");
+  const [columnValues, setColumnValues] = useState<string[]>([]);
+  const [valueSearch, setValueSearch] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [selectedValue, setSelectedValue] = useState("");
+  const [loadingIdCols, setLoadingIdCols] = useState(false);
+
+  const selectedResource = resources.find((r) => r.id === selectedResourceId);
+
+  const resourceBlobs = useMemo(() => {
+    if (!selectedResource) return [];
+    return blobs.filter((b) => b.name.startsWith(selectedResource.technical_name));
+  }, [selectedResource, blobs]);
+
+  // Load all data
+  const loadData = useCallback(async () => {
+    try {
+      const [d, dc, runs, r, mi, qa] = await Promise.all([
+        getDags(),
+        getDagConfig(),
+        getDagRuns(),
+        getRules(),
+        getMappingIssues(selectedResourceId || undefined),
+        getQAExamples(selectedResourceId || undefined),
+      ]);
+      setDags(d);
+      setDagConfig(dc);
+      setDagRuns(runs);
+      setRules(r);
+      setMappingIssues(mi);
+      setQAExamples(qa);
+      if (dc.environments.length > 0 && !dc.environments.includes(selectedEnv)) {
+        setSelectedEnv(dc.environments[0]);
+      }
+    } catch { /* ignore load errors */ }
+  }, [selectedResourceId, selectedEnv]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  // Load resource DAG links
+  useEffect(() => {
+    if (!selectedResource) return;
+    const dagIds = selectedResource.dag_ids ?? [];
+    setResourceDagIds(dagIds);
+  }, [selectedResource]);
+
+  // Load ID columns when resource changes
+  useEffect(() => {
+    if (!selectedResource || resourceBlobs.length === 0 || !containerUrl) return;
+    setLoadingIdCols(true);
+    getIdColumns(containerUrl, resourceBlobs.map((b) => b.name))
+      .then((cols) => { setIdColumns(cols); setSelectedIdColumn(cols[0] ?? ""); })
+      .catch(() => {})
+      .finally(() => setLoadingIdCols(false));
+  }, [selectedResource, resourceBlobs, containerUrl]);
+
+  // Load column values when ID column changes
+  useEffect(() => {
+    if (!selectedIdColumn || resourceBlobs.length === 0 || !containerUrl) {
+      setColumnValues([]);
+      return;
+    }
+    getColumnValues(containerUrl, resourceBlobs.map((b) => b.name), selectedIdColumn)
+      .then((data) => setColumnValues(data.values))
+      .catch(() => setColumnValues([]));
+  }, [selectedIdColumn, resourceBlobs, containerUrl]);
+
+  // Volumetry
+  const handleRefreshVolumetry = async () => {
+    if (!selectedResourceId || resourceBlobs.length === 0) return;
+    setVolumetryData((prev) => ({ ...prev, [selectedResourceId]: { profiles: [], status: "loading" } }));
+
+    await profileBlobsStream(
+      containerUrl,
+      resourceBlobs.map((b) => b.name),
+      (progress) => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [selectedResourceId]: { ...prev[selectedResourceId], status: "loading", progress: { current: progress.current, total: progress.total, currentBlob: progress.blob_name } },
+        }));
+      },
+      (profile) => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [selectedResourceId]: { ...prev[selectedResourceId], status: "loading", profiles: [...(prev[selectedResourceId]?.profiles ?? []), profile] },
+        }));
+      },
+      () => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [selectedResourceId]: { ...prev[selectedResourceId], status: "loaded", progress: undefined, lastUpdated: new Date().toISOString() },
+        }));
+      },
+      (message) => {
+        setVolumetryData((prev) => ({
+          ...prev,
+          [selectedResourceId]: { status: "error", profiles: prev[selectedResourceId]?.profiles ?? [], error: message, progress: undefined },
+        }));
+      },
+    );
+  };
+
+  // DAG runner
+  const linkedDags = useMemo(() => {
+    return resourceDagIds.map((id) => dags.find((d) => d.id === id)).filter(Boolean) as DAG[];
+  }, [resourceDagIds, dags]);
+
+  const handleTriggerDag = async (dag: DAG) => {
+    setRunningDagId(dag.dag_id);
+    setDagLogs([]);
+
+    await triggerDagStream(
+      dag.dag_id,
+      selectedEnv,
+      (entry) => setDagLogs((prev) => [...prev, entry]),
+      async (result) => {
+        setRunningDagId(null);
+        // After trigger, fetch logs for mapping issues
+        if (result.run_id) {
+          await fetchDagLogsStream(
+            dag.dag_id,
+            result.run_id,
+            (entry) => setDagLogs((prev) => [...prev, entry]),
+            async (issues) => {
+              if (issues.length > 0 && selectedResourceId) {
+                await saveMappingIssues(issues, selectedResourceId, result.record_id);
+                const updated = await getMappingIssues(selectedResourceId);
+                setMappingIssues(updated);
+              }
+            },
+            () => {},
+            () => {},
+            ["load", "update"],
+          );
+        }
+        // Refresh runs
+        const runs = await getDagRuns();
+        setDagRuns(runs);
+      },
+      () => setRunningDagId(null),
+    );
+  };
+
+  const getLastRun = (dagId: string): DAGRun | undefined => {
+    return dagRuns
+      .filter((r) => r.dag_id === dagId && r.padoa_env === selectedEnv)
+      .sort((a, b) => b.triggered_at.localeCompare(a.triggered_at))[0];
+  };
+
+  // DAG linking
+  const handleToggleDagLink = async (dagId: string) => {
+    const newIds = resourceDagIds.includes(dagId)
+      ? resourceDagIds.filter((id) => id !== dagId)
+      : [...resourceDagIds, dagId];
+    setLinkingDags(true);
+    try {
+      await linkResourceDags(selectedResourceId, newIds);
+      setResourceDagIds(newIds);
+    } catch { /* ignore */ }
+    setLinkingDags(false);
+  };
+
+  // Rule toggle
+  const handleToggleRule = async (ruleId: string, checked: boolean) => {
+    await updateRule(ruleId, { checked });
+    setRules((prev) => prev.map((r) => r.id === ruleId ? { ...r, checked } : r));
+  };
+
+  // QA examples
+  const handleAddQAExample = async () => {
+    if (!selectedValue || !selectedIdColumn || !selectedResourceId) return;
+    await createQAExample({
+      resource_id: selectedResourceId,
+      id_column: selectedIdColumn,
+      id_value: selectedValue,
+      label: newLabel || "Example ID",
+    });
+    const updated = await getQAExamples(selectedResourceId);
+    setQAExamples(updated);
+    setSelectedValue("");
+    setNewLabel("");
+  };
+
+  const handleDeleteQAExample = async (id: string) => {
+    await deleteQAExample(id);
+    const updated = await getQAExamples(selectedResourceId);
+    setQAExamples(updated);
+  };
+
+  // Mapping issue resolve
+  const handleResolve = async (issueId: string, resolved: boolean) => {
+    await resolveMappingIssue(issueId, resolved);
+    const updated = await getMappingIssues(selectedResourceId);
+    setMappingIssues(updated);
+  };
+
+  // Volumetry stats
+  const volEntry = volumetryData[selectedResourceId];
+  const stageRowCounts = useMemo(() => {
+    if (!volEntry?.profiles) return {};
+    const counts: Record<string, number> = {};
+    for (const p of volEntry.profiles) {
+      const stage = p.detected_stage;
+      counts[stage] = (counts[stage] ?? 0) + p.row_count;
+    }
+    return counts;
+  }, [volEntry]);
+
+  const resourceRules = useMemo(() => {
+    return rules.filter((r) => r.resource_ids.includes(selectedResourceId));
+  }, [rules, selectedResourceId]);
+
+  const openIssues = useMemo(() => {
+    return mappingIssues.filter((i) => !i.resolved);
+  }, [mappingIssues]);
+
+  const issuesByColumn = useMemo(() => {
+    const grouped: Record<string, MappingIssue[]> = {};
+    for (const issue of mappingIssues) {
+      if (!grouped[issue.column]) grouped[issue.column] = [];
+      grouped[issue.column].push(issue);
+    }
+    return grouped;
+  }, [mappingIssues]);
+
+  const filteredValues = useMemo(() => {
+    if (!valueSearch) return columnValues.slice(0, 50);
+    return columnValues.filter((v) => v.toLowerCase().includes(valueSearch.toLowerCase())).slice(0, 50);
+  }, [columnValues, valueSearch]);
+
+  if (resources.length === 0) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center">
+          <p className="text-gray-500 mb-4">No resources defined yet. Create resources first.</p>
+          <button onClick={onBack} className="text-sm text-indigo-600 hover:text-indigo-800">Go back</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Top bar */}
+      <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <button onClick={onBack} className="text-sm text-gray-400 hover:text-gray-700 transition-colors">
+            &larr;
+          </button>
+          <span className="text-gray-200">|</span>
+          <h2 className="text-sm font-semibold text-gray-800">Resource Dashboard</h2>
+        </div>
+        <div className="flex items-center gap-3">
+          <select
+            value={selectedResourceId}
+            onChange={(e) => setSelectedResourceId(e.target.value)}
+            className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          >
+            {resources.map((r) => (
+              <option key={r.id} value={r.id}>{r.business_name}</option>
+            ))}
+          </select>
+          <select
+            value={selectedEnv}
+            onChange={(e) => setSelectedEnv(e.target.value)}
+            className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          >
+            {dagConfig.environments.map((env) => (
+              <option key={env} value={env}>{env}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <div className="max-w-7xl mx-auto px-6 py-6 space-y-6">
+        {/* Top row: Volumetry + Mapping Issues */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Volumetry */}
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-gray-700">Volumetry</h3>
+              <button
+                onClick={handleRefreshVolumetry}
+                disabled={volEntry?.status === "loading"}
+                className="text-xs text-indigo-600 hover:text-indigo-800 disabled:text-gray-400"
+              >
+                {volEntry?.status === "loading" ? "Loading..." : "Refresh"}
+              </button>
+            </div>
+            {volEntry?.status === "loading" && volEntry.progress && (
+              <p className="text-xs text-gray-400 mb-2">
+                Profiling {volEntry.progress.current}/{volEntry.progress.total}...
+              </p>
+            )}
+            {Object.keys(stageRowCounts).length > 0 ? (
+              <div className="space-y-2">
+                {Object.entries(stageRowCounts).sort(([a], [b]) => a.localeCompare(b)).map(([stage, count]) => (
+                  <div key={stage} className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">{stage}</span>
+                    <span className="text-sm font-mono font-medium text-gray-800">{count.toLocaleString()}</span>
+                  </div>
+                ))}
+                {Object.keys(stageRowCounts).length >= 2 && (
+                  <div className="pt-2 border-t border-gray-100">
+                    <div className="flex items-center justify-between text-xs text-gray-500">
+                      <span>Drop rate (extract &rarr; last)</span>
+                      <span>
+                        {(() => {
+                          const vals = Object.values(stageRowCounts);
+                          const first = vals[0];
+                          const last = vals[vals.length - 1];
+                          if (first === 0) return "N/A";
+                          return ((1 - last / first) * 100).toFixed(1) + "%";
+                        })()}
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-400">
+                {volEntry?.status === "error" ? volEntry.error : "Click Refresh to load volumetry data."}
+              </p>
+            )}
+          </div>
+
+          {/* Mapping Issues */}
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-gray-700">
+                Mapping Issues
+                {openIssues.length > 0 && (
+                  <span className="ml-2 text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded-full font-medium">
+                    {openIssues.length} open
+                  </span>
+                )}
+              </h3>
+            </div>
+            {Object.keys(issuesByColumn).length > 0 ? (
+              <div className="space-y-3 max-h-64 overflow-y-auto">
+                {Object.entries(issuesByColumn).map(([column, issues]) => (
+                  <div key={column}>
+                    <h4 className="text-xs font-medium text-gray-500 mb-1">column: {column}</h4>
+                    {issues.map((issue) => (
+                      <div key={issue.id} className="flex items-center justify-between py-1 pl-3">
+                        <div className="flex items-center gap-2">
+                          <span className={`text-sm ${issue.resolved ? "text-gray-400 line-through" : "text-gray-800"}`}>
+                            &quot;{issue.unmapped_value}&quot;
+                          </span>
+                          <span className="text-xs text-gray-400">
+                            (since {new Date(issue.first_seen).toLocaleDateString()})
+                          </span>
+                          {issue.fixed_in_rerun && !issue.resolved && (
+                            <span className="text-xs bg-green-100 text-green-700 px-1.5 py-0.5 rounded">
+                              Fixed in re-run {issue.fixed_in_rerun}
+                            </span>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => handleResolve(issue.id, !issue.resolved)}
+                          className={`text-xs px-2 py-0.5 rounded transition-colors ${
+                            issue.resolved
+                              ? "text-gray-500 hover:text-amber-600"
+                              : "text-green-600 hover:text-green-800 border border-green-200"
+                          }`}
+                        >
+                          {issue.resolved ? "Unresolve" : "Resolve"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-400">No mapping issues found. Run a DAG to check for issues.</p>
+            )}
+          </div>
+        </div>
+
+        {/* Middle row: QA Example IDs + Integration Rules */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* QA Example IDs */}
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">QA Example IDs</h3>
+
+            {/* Column selector */}
+            <div className="flex items-center gap-2 mb-3">
+              <label className="text-xs text-gray-500">Column:</label>
+              <select
+                value={selectedIdColumn}
+                onChange={(e) => setSelectedIdColumn(e.target.value)}
+                disabled={loadingIdCols}
+                className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              >
+                {idColumns.map((col) => (
+                  <option key={col} value={col}>{col}</option>
+                ))}
+              </select>
+              {idColumns.length > 1 && (
+                <span className="text-xs text-gray-400">
+                  (also: {idColumns.filter((c) => c !== selectedIdColumn).join(", ")})
+                </span>
+              )}
+            </div>
+
+            {/* Saved examples */}
+            {qaExamples.length > 0 && (
+              <div className="space-y-1 mb-3">
+                {qaExamples.map((ex) => (
+                  <div key={ex.id} className="flex items-center justify-between py-1">
+                    <div>
+                      <span className="text-sm font-mono text-gray-800">{ex.id_value}</span>
+                      <span className="text-xs text-gray-400 ml-2">({ex.id_column})</span>
+                      <span className="text-xs text-gray-500 ml-2">- {ex.label}</span>
+                    </div>
+                    <button
+                      onClick={() => handleDeleteQAExample(ex.id)}
+                      className="text-xs text-gray-400 hover:text-red-500"
+                    >
+                      x
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Add from values */}
+            <div className="border-t border-gray-100 pt-3 space-y-2">
+              <input
+                type="text"
+                placeholder="Search values..."
+                value={valueSearch}
+                onChange={(e) => setValueSearch(e.target.value)}
+                className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              />
+              {filteredValues.length > 0 && (
+                <div className="max-h-32 overflow-y-auto border border-gray-100 rounded-lg">
+                  {filteredValues.map((v) => (
+                    <button
+                      key={v}
+                      onClick={() => setSelectedValue(v)}
+                      className={`block w-full text-left px-2 py-1 text-xs hover:bg-indigo-50 ${selectedValue === v ? "bg-indigo-100 text-indigo-800" : "text-gray-700"}`}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {selectedValue && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono text-gray-800">{selectedValue}</span>
+                  <input
+                    type="text"
+                    placeholder="Label (e.g. 'dropped at clean')"
+                    value={newLabel}
+                    onChange={(e) => setNewLabel(e.target.value)}
+                    className="flex-1 border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                  />
+                  <button
+                    onClick={handleAddQAExample}
+                    className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white px-2 py-1 rounded-lg"
+                  >
+                    Add
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Integration Rules */}
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">
+              Integration Rules
+              {resourceRules.length > 0 && (
+                <span className="ml-2 text-xs text-gray-400">
+                  {resourceRules.filter((r) => r.checked).length}/{resourceRules.length} verified
+                </span>
+              )}
+            </h3>
+            {resourceRules.length > 0 ? (
+              <div className="space-y-2">
+                {resourceRules.map((rule) => (
+                  <label key={rule.id} className="flex items-start gap-2 cursor-pointer group">
+                    <input
+                      type="checkbox"
+                      checked={rule.checked}
+                      onChange={(e) => handleToggleRule(rule.id, e.target.checked)}
+                      className="mt-1 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span className={`text-sm ${rule.checked ? "text-gray-400 line-through" : "text-gray-800"}`}>
+                      {rule.description}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-400">No rules linked to this resource. Link rules in the Integration Rule Manager.</p>
+            )}
+          </div>
+        </div>
+
+        {/* Bottom: DAG Runner */}
+        <div className="bg-white border border-gray-200 rounded-xl p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-gray-700">
+              DAG Runner
+              <span className="ml-2 text-xs text-gray-400 font-normal">padoa_env: {selectedEnv}</span>
+            </h3>
+            <div className="relative">
+              <button
+                onClick={() => setShowDagLinkDropdown(!showDagLinkDropdown)}
+                disabled={linkingDags}
+                className="text-xs text-indigo-600 hover:text-indigo-800"
+              >
+                {linkingDags ? "Saving..." : "Link DAGs"}
+              </button>
+              {showDagLinkDropdown && (
+                <div className="absolute right-0 top-6 z-10 bg-white border border-gray-200 rounded-lg shadow-lg p-2 min-w-[200px]">
+                  {dags.length === 0 && <p className="text-xs text-gray-400 p-2">No DAGs defined. Add them in DAG Manager.</p>}
+                  {dags.map((d) => (
+                    <label key={d.id} className="flex items-center gap-2 px-2 py-1 hover:bg-gray-50 cursor-pointer rounded">
+                      <input
+                        type="checkbox"
+                        checked={resourceDagIds.includes(d.id)}
+                        onChange={() => handleToggleDagLink(d.id)}
+                        className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                      />
+                      <span className="text-xs text-gray-700">{d.display_name}</span>
+                      <span className="text-xs text-gray-400 font-mono">{d.dag_id}</span>
+                    </label>
+                  ))}
+                  <button
+                    onClick={() => setShowDagLinkDropdown(false)}
+                    className="mt-1 w-full text-xs text-gray-500 hover:text-gray-700 text-center py-1 border-t border-gray-100"
+                  >
+                    Done
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {linkedDags.length > 0 ? (
+            <div className="space-y-2">
+              {linkedDags.map((dag, idx) => {
+                const lastRun = getLastRun(dag.dag_id);
+                const isRunning = runningDagId === dag.dag_id;
+
+                return (
+                  <div key={dag.id} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-gray-400 font-medium">{idx + 1}.</span>
+                      <span className="text-sm font-medium text-gray-800">{dag.display_name}</span>
+                      <span className="text-xs font-mono text-gray-400">{dag.dag_id}</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {lastRun && (
+                        <span className={`text-xs ${lastRun.status === "triggered" ? "text-green-600" : "text-gray-500"}`}>
+                          {lastRun.status === "triggered" ? "\u2713" : "\u2717"}{" "}
+                          {new Date(lastRun.triggered_at).toLocaleString()}
+                        </span>
+                      )}
+                      {!lastRun && <span className="text-xs text-gray-400">not run yet</span>}
+                      <button
+                        onClick={() => handleTriggerDag(dag)}
+                        disabled={isRunning || runningDagId !== null}
+                        className="text-xs bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
+                      >
+                        {isRunning ? "Running..." : "Run"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-400">No DAGs linked. Click &quot;Link DAGs&quot; to add them.</p>
+          )}
+
+          {/* DAG logs */}
+          {dagLogs.length > 0 && (
+            <div className="mt-4">
+              <LogPanel entries={dagLogs} running={runningDagId !== null} />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
