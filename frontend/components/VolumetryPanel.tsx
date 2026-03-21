@@ -28,7 +28,8 @@ interface Props {
   open: boolean;
   onToggle: () => void;
   resources: Resource[];
-  blobs: BlobInfo[];
+  hasContainer: boolean;
+  filteredBlobsByResource: Record<string, BlobInfo[]>;
   volumetryData: Record<string, VolumetryEntry>;
   onRefresh: (resourceId: string) => void;
 }
@@ -55,7 +56,8 @@ export default function VolumetryPanel({
   open,
   onToggle,
   resources,
-  blobs,
+  hasContainer,
+  filteredBlobsByResource,
   volumetryData,
   onRefresh,
 }: Props) {
@@ -93,7 +95,7 @@ export default function VolumetryPanel({
         <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between flex-shrink-0">
           <h3 className="text-sm font-semibold text-gray-800">Volumetry</h3>
           <span className="text-xs text-gray-400">
-            {blobs.length > 0 ? `${blobs.length} files` : "No container"}
+            {hasContainer ? `${Object.values(filteredBlobsByResource).reduce((s, a) => s + a.length, 0)} files` : "No container"}
           </span>
         </div>
 
@@ -106,9 +108,7 @@ export default function VolumetryPanel({
           ) : (
             <div className="divide-y divide-gray-100">
               {resources.map((resource) => {
-                const matchingBlobs = blobs.filter((b) =>
-                  b.name.startsWith(resource.technical_name)
-                );
+                const matchingBlobs = filteredBlobsByResource[resource.id] ?? [];
                 const entry = volumetryData[resource.id];
                 const isLoading = entry?.status === "loading";
                 const isLoaded = entry?.status === "loaded";
