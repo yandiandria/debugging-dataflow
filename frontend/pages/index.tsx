@@ -200,6 +200,7 @@ export default function Home() {
     content = (
       <ResourceManager
         resources={resources}
+        blobs={blobs}
         onCreate={async (tn, bn) => { await createResource(tn, bn); await refreshResources(); }}
         onUpdate={async (id, tn, bn) => { await updateResource(id, tn, bn); await refreshResources(); }}
         onDelete={async (id) => { await deleteResource(id); await refreshResources(); }}
