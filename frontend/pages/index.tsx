@@ -5,6 +5,8 @@ import AnalysisConfig from "../components/AnalysisConfig";
 import FlowResults from "../components/FlowResults";
 import LogPanel from "../components/LogPanel";
 import ResourceManager from "../components/ResourceManager";
+import VolumetryPanel from "../components/VolumetryPanel";
+import type { VolumetryEntry } from "../components/VolumetryPanel";
 import {
   listBlobs,
   analyzeStream,
@@ -12,6 +14,7 @@ import {
   createResource,
   updateResource,
   deleteResource,
+  profileBlobs,
 } from "../lib/api";
 import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
@@ -29,6 +32,10 @@ export default function Home() {
 
   const [resources, setResources] = useState<Resource[]>([]);
 
+  // Volumetry panel state — cleared when container changes
+  const [volumetryPanelOpen, setVolumetryPanelOpen] = useState(false);
+  const [volumetryData, setVolumetryData] = useState<Record<string, VolumetryEntry>>({});
+
   // Load resources once on mount
   useEffect(() => {
     getResources().then(setResources).catch(() => {});
@@ -45,6 +52,8 @@ export default function Home() {
       setContainerUrl(url);
       setBlobs(data);
       setSelected(new Set());
+      // Clear volumetry when connecting to a new container
+      setVolumetryData({});
       setStep("browse");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unknown error");
@@ -91,6 +100,47 @@ export default function Home() {
     await refreshResources();
   };
 
+  // ── Volumetry handler ──────────────────────────────────────────────────────
+  const handleProfileResource = async (resourceId: string) => {
+    const resource = resources.find((r) => r.id === resourceId);
+    if (!resource || blobs.length === 0) return;
+
+    const matchingBlobNames = blobs
+      .filter((b) => b.name.startsWith(resource.technical_name))
+      .map((b) => b.name);
+
+    if (matchingBlobNames.length === 0) return;
+
+    setVolumetryData((prev) => ({
+      ...prev,
+      [resourceId]: {
+        ...(prev[resourceId] ?? { profiles: [] }),
+        status: "loading",
+      },
+    }));
+
+    try {
+      const profiles = await profileBlobs(containerUrl, matchingBlobNames);
+      setVolumetryData((prev) => ({
+        ...prev,
+        [resourceId]: {
+          status: "loaded",
+          profiles,
+          lastUpdated: new Date().toISOString(),
+        },
+      }));
+    } catch (e: unknown) {
+      setVolumetryData((prev) => ({
+        ...prev,
+        [resourceId]: {
+          status: "error",
+          profiles: prev[resourceId]?.profiles ?? [],
+          error: e instanceof Error ? e.message : "Failed to profile",
+        },
+      }));
+    }
+  };
+
   // ── Resets ─────────────────────────────────────────────────────────────────
   const handleDisconnect = () => {
     setContainerUrl("");
@@ -99,6 +149,7 @@ export default function Home() {
     setResult(null);
     setLogs([]);
     setError(null);
+    setVolumetryData({});
     setStep("connect");
   };
 
@@ -111,12 +162,12 @@ export default function Home() {
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
-  if (step === "connect") {
-    return <ConnectionForm onConnect={handleConnect} loading={loading} error={error} />;
-  }
+  let content: React.ReactNode = null;
 
-  if (step === "resources") {
-    return (
+  if (step === "connect") {
+    content = <ConnectionForm onConnect={handleConnect} loading={loading} error={error} />;
+  } else if (step === "resources") {
+    content = (
       <ResourceManager
         resources={resources}
         onCreate={async (tn, bn) => { await createResource(tn, bn); await refreshResources(); }}
@@ -125,10 +176,8 @@ export default function Home() {
         onBack={() => setStep("browse")}
       />
     );
-  }
-
-  if (step === "browse") {
-    return (
+  } else if (step === "browse") {
+    content = (
       <div className="min-h-screen bg-gray-50 p-6">
         <div className="max-w-screen-xl mx-auto">
           <div className="mb-4">
@@ -151,10 +200,8 @@ export default function Home() {
         </div>
       </div>
     );
-  }
-
-  if (step === "config") {
-    return (
+  } else if (step === "config") {
+    content = (
       <AnalysisConfig
         containerUrl={containerUrl}
         selectedBlobs={Array.from(selected)}
@@ -164,10 +211,8 @@ export default function Home() {
         error={error}
       />
     );
-  }
-
-  if (step === "analyzing") {
-    return (
+  } else if (step === "analyzing") {
+    content = (
       <div className="min-h-screen bg-gray-950 flex flex-col items-center justify-center p-6">
         <div className="w-full max-w-2xl">
           <div className="flex items-center gap-3 mb-4">
@@ -182,10 +227,8 @@ export default function Home() {
         </div>
       </div>
     );
-  }
-
-  if (step === "results" && result) {
-    return (
+  } else if (step === "results" && result) {
+    content = (
       <FlowResults
         result={result}
         logs={logs}
@@ -195,5 +238,17 @@ export default function Home() {
     );
   }
 
-  return null;
+  return (
+    <>
+      {content}
+      <VolumetryPanel
+        open={volumetryPanelOpen}
+        onToggle={() => setVolumetryPanelOpen((p) => !p)}
+        resources={resources}
+        blobs={blobs}
+        volumetryData={volumetryData}
+        onRefresh={handleProfileResource}
+      />
+    </>
+  );
 }

@@ -17,7 +17,13 @@ const STAGE_COLORS: Record<string, string> = {
 /**
  * Build a map from each blob name → its group prefix (stem of the extract blob).
  */
-function buildGroupPrefixMap(allBlobs: BlobInfo[]): Map<string, string> {
+function buildGroupPrefixMap(allBlobs: BlobInfo[], resources: Resource[]): Map<string, string> {
+  // Resources sorted longest-first so the most specific prefix wins
+  const sortedResources = [...resources].sort(
+    (a, b) => b.technical_name.length - a.technical_name.length
+  );
+
+  // Extract stems as fallback grouping
   const extractStems = allBlobs
     .filter((b) => b.detected_stage === "extract")
     .map((b) => b.name.replace(/\.csv$/i, ""))
@@ -25,6 +31,15 @@ function buildGroupPrefixMap(allBlobs: BlobInfo[]): Map<string, string> {
 
   const map = new Map<string, string>();
   for (const blob of allBlobs) {
+    // Resource prefix takes priority
+    const matchedResource = sortedResources.find((r) =>
+      blob.name.startsWith(r.technical_name)
+    );
+    if (matchedResource) {
+      map.set(blob.name, matchedResource.technical_name);
+      continue;
+    }
+    // Fallback: extract-based grouping
     const match = extractStems.find((stem) => blob.name.startsWith(stem));
     map.set(blob.name, match ?? blob.name.replace(/\.csv$/i, ""));
   }
@@ -110,7 +125,7 @@ export default function FileBrowser({
     });
   }, [blobs, search, stageFilter]);
 
-  const groupPrefixMap = useMemo(() => buildGroupPrefixMap(blobs), [blobs]);
+  const groupPrefixMap = useMemo(() => buildGroupPrefixMap(blobs, resources), [blobs, resources]);
 
   const allGroups = useMemo((): BlobGroup[] => {
     const map = new Map<string, BlobGroup>();
