@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import pandas as pd
+import polars as pl
 from azure.core.exceptions import AzureError
 from azure.storage.blob import ContainerClient
 from fastapi import FastAPI, HTTPException
@@ -864,18 +865,18 @@ async def preview_blob(request: PreviewRequest):
 def _profile_one_blob_sync(blob_client, blob_name: str) -> dict:
     """Download and profile a single blob. Runs synchronously — call via asyncio.to_thread."""
     raw = blob_client.download_blob().readall()
-    df = pd.read_csv(io.BytesIO(raw))
+    df = pl.read_csv(io.BytesIO(raw), infer_schema_length=10000)
     col_profiles = []
     for col in df.columns:
-        distinct = int(df[col].nunique(dropna=False))
+        distinct = df[col].n_unique()
         vc = None
         if distinct < 10:
-            series = df[col].value_counts(dropna=False)
-            vc = {}
-            for k, v in series.items():
-                key = "null" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
-                vc[key] = int(v)
-        col_profiles.append({"name": col, "distinct_count": distinct, "value_counts": vc})
+            vc_df = df[col].value_counts(sort=True)
+            vc = {
+                ("null" if k is None else str(k)): int(count)
+                for k, count in vc_df.iter_rows()
+            }
+        col_profiles.append({"name": col, "distinct_count": int(distinct), "value_counts": vc})
     return {
         "blob_name": blob_name,
         "detected_stage": detect_stage(blob_name) or "unknown",
