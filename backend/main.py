@@ -861,6 +861,29 @@ async def preview_blob(request: PreviewRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _profile_one_blob_sync(blob_client, blob_name: str) -> dict:
+    """Download and profile a single blob. Runs synchronously — call via asyncio.to_thread."""
+    raw = blob_client.download_blob().readall()
+    df = pd.read_csv(io.BytesIO(raw))
+    col_profiles = []
+    for col in df.columns:
+        distinct = int(df[col].nunique(dropna=False))
+        vc = None
+        if distinct < 10:
+            series = df[col].value_counts(dropna=False)
+            vc = {}
+            for k, v in series.items():
+                key = "null" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
+                vc[key] = int(v)
+        col_profiles.append({"name": col, "distinct_count": distinct, "value_counts": vc})
+    return {
+        "blob_name": blob_name,
+        "detected_stage": detect_stage(blob_name) or "unknown",
+        "row_count": len(df),
+        "columns": col_profiles,
+    }
+
+
 @app.post("/api/blobs/profile")
 async def profile_blobs(request: ProfileRequest) -> List[Dict]:
     """Return row count and per-column cardinality for each blob."""
@@ -869,43 +892,21 @@ async def profile_blobs(request: ProfileRequest) -> List[Dict]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    results = []
-    for blob_name in request.blob_names:
+    async def profile_one(blob_name: str) -> dict:
         try:
-            raw = client.get_blob_client(blob_name).download_blob().readall()
-            df = pd.read_csv(io.BytesIO(raw))
-
-            col_profiles = []
-            for col in df.columns:
-                distinct = int(df[col].nunique(dropna=False))
-                vc = None
-                if distinct < 10:
-                    series = df[col].value_counts(dropna=False)
-                    vc = {}
-                    for k, v in series.items():
-                        key = "null" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
-                        vc[key] = int(v)
-                col_profiles.append({
-                    "name": col,
-                    "distinct_count": distinct,
-                    "value_counts": vc,
-                })
-
-            results.append({
-                "blob_name": blob_name,
-                "detected_stage": detect_stage(blob_name) or "unknown",
-                "row_count": len(df),
-                "columns": col_profiles,
-            })
+            return await asyncio.to_thread(
+                _profile_one_blob_sync, client.get_blob_client(blob_name), blob_name
+            )
         except Exception as e:
-            results.append({
+            return {
                 "blob_name": blob_name,
                 "detected_stage": detect_stage(blob_name) or "unknown",
                 "row_count": -1,
                 "columns": [],
                 "error": str(e),
-            })
-    return results
+            }
+
+    return list(await asyncio.gather(*[profile_one(b) for b in request.blob_names]))
 
 
 @app.post("/api/blobs/profile/stream")
@@ -928,34 +929,10 @@ async def profile_blobs_stream(request: ProfileRequest) -> StreamingResponse:
                 "blob_name": blob_name,
             })
             try:
-                raw = client.get_blob_client(blob_name).download_blob().readall()
-                df = pd.read_csv(io.BytesIO(raw))
-
-                col_profiles = []
-                for col in df.columns:
-                    distinct = int(df[col].nunique(dropna=False))
-                    vc = None
-                    if distinct < 10:
-                        series = df[col].value_counts(dropna=False)
-                        vc = {}
-                        for k, v in series.items():
-                            key = "null" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
-                            vc[key] = int(v)
-                    col_profiles.append({
-                        "name": col,
-                        "distinct_count": distinct,
-                        "value_counts": vc,
-                    })
-
-                yield _sse({
-                    "type": "profile",
-                    "data": {
-                        "blob_name": blob_name,
-                        "detected_stage": detect_stage(blob_name) or "unknown",
-                        "row_count": len(df),
-                        "columns": col_profiles,
-                    },
-                })
+                data = await asyncio.to_thread(
+                    _profile_one_blob_sync, client.get_blob_client(blob_name), blob_name
+                )
+                yield _sse({"type": "profile", "data": data})
             except Exception as e:
                 yield _sse({
                     "type": "profile",
@@ -1000,6 +977,127 @@ def _apply_single_filter(df: pd.DataFrame, f: FilterCondition) -> pd.DataFrame:
             return df[col.astype(str) == f.value]
 
 
+def _download_blob_to_disk(blob_client, local_path: str) -> int:
+    """Download a blob and save it to disk. Returns file size in bytes. Runs sync — use to_thread."""
+    raw = blob_client.download_blob().readall()
+    with open(local_path, "wb") as fh:
+        fh.write(raw)
+    return len(raw)
+
+
+def _process_stage_sync(
+    local_paths: List[str],
+    active_filters: List,
+    filter_logic: str,
+    deduplicate: bool,
+    key_columns: List[str],
+) -> tuple:
+    """Read CSVs, merge, filter, dedup. Returns (merged_df, dedup_info, log_lines). Runs sync — use to_thread."""
+    logs: List[tuple] = []
+    dfs = [pd.read_csv(p) for p in local_paths]
+    merged = pd.concat(dfs, ignore_index=True)
+    logs.append(("success", f"{len(merged)} rows after merge."))
+
+    if active_filters:
+        if filter_logic == "OR":
+            parts: List[pd.DataFrame] = []
+            for f in active_filters:
+                if f.column not in merged.columns:
+                    logs.append(("warning", f"Filter column '{f.column}' not found — skipped."))
+                    continue
+                try:
+                    part = _apply_single_filter(merged, f)
+                    parts.append(part)
+                    op = "~" if f.filter_type == "regex" else "="
+                    logs.append(("info", f"Filter '{f.column} {op} {f.value}' matched {len(part)} row(s)."))
+                except ValueError as exc:
+                    logs.append(("warning", f"{exc} — skipped."))
+            if parts:
+                merged = pd.concat(parts).drop_duplicates()
+            logs.append(("success", f"OR filter → {len(merged)} rows remain."))
+        else:  # AND
+            for f in active_filters:
+                if f.column not in merged.columns:
+                    logs.append(("warning", f"Filter column '{f.column}' not found — skipped."))
+                    continue
+                before = len(merged)
+                try:
+                    merged = _apply_single_filter(merged, f)
+                except ValueError as exc:
+                    logs.append(("warning", f"{exc} — skipped."))
+                    continue
+                op = "~" if f.filter_type == "regex" else "="
+                logs.append(("info", f"Filter '{f.column} {op} {f.value}' → {len(merged)} rows remain (was {before})."))
+
+    dedup_info: Optional[Dict] = None
+    if deduplicate:
+        valid_keys = [k for k in key_columns if k in merged.columns]
+        if valid_keys:
+            before = len(merged)
+            merged = merged.drop_duplicates(subset=valid_keys, keep="first")
+            after = len(merged)
+            if before > after:
+                removed = before - after
+                dedup_info = {"removed": removed, "kept": after}
+                logs.append(("warning", f"Deduplicated: {removed} duplicate(s) removed, {after} row(s) kept."))
+            else:
+                logs.append(("info", "No duplicates found."))
+
+    return merged, dedup_info, logs
+
+
+def _build_flow_report(
+    stage_dfs: Dict[str, Any],
+    key_columns: List[str],
+    ordered_stages: List[str],
+    dedup_warnings: Dict[str, Dict[str, int]],
+) -> tuple:
+    """Collect unique key tuples and build per-record flow. Returns (rows, columns_per_stage). Runs sync — use to_thread."""
+    all_key_tuples: set = set()
+    for stage, df in stage_dfs.items():
+        valid_keys = [k for k in key_columns if k in df.columns]
+        if not valid_keys:
+            continue
+        for _, row in df.iterrows():
+            key_tuple = tuple((k, str(row[k])) for k in valid_keys)
+            all_key_tuples.add(key_tuple)
+
+    rows = []
+    for key_tuple in sorted(all_key_tuples):
+        key_dict = dict(key_tuple)
+        flow: Dict[str, Any] = {}
+        missing_stages: List[str] = []
+        last_seen_stage: Optional[str] = None
+
+        for stage in ordered_stages:
+            df = stage_dfs[stage]
+            valid_keys = [k for k in key_columns if k in df.columns]
+            if not valid_keys:
+                missing_stages.append(stage)
+                continue
+            mask = pd.Series(True, index=df.index)
+            for k in valid_keys:
+                if k in key_dict:
+                    mask &= df[k].astype(str) == key_dict[k]
+            matches = df[mask]
+            if matches.empty:
+                missing_stages.append(stage)
+            else:
+                flow[stage] = json.loads(matches.iloc[[0]].to_json(orient="records"))[0]
+                last_seen_stage = stage
+
+        rows.append({
+            "key_value": key_dict,
+            "flow": flow,
+            "missing_stages": missing_stages,
+            "last_seen_stage": last_seen_stage,
+            "dedup_warnings": {s: dedup_warnings[s] for s in dedup_warnings if s in flow},
+        })
+
+    columns_per_stage = {stage: list(df.columns) for stage, df in stage_dfs.items()}
+    return rows, columns_per_stage
+
+
 @app.post("/api/analyze")
 async def analyze(request: AnalyzeRequest) -> StreamingResponse:
     """
@@ -1036,179 +1134,62 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                 f"{len(stage_blobs)} stage(s): {', '.join(stage_blobs.keys())}."
             )
 
-            # ── 2. Download → disk, read, merge, filter, dedup per stage ──────
+            # ── 2. Download → disk, merge, filter, dedup per stage ────────────
             stage_dfs: Dict[str, pd.DataFrame] = {}
             dedup_warnings: Dict[str, Dict[str, int]] = {}
+            active_filters = [f for f in request.filters if f.column and f.value]
 
             for stage, blobs in stage_blobs.items():
-                dfs = []
+                local_paths: List[str] = []
 
                 for blob_name in blobs:
                     yield _log(f"[{stage}] Downloading {blob_name}…")
                     blob_client = client.get_blob_client(blob_name)
-
-                    # Flatten folder separators so the local filename is safe
                     safe_name = blob_name.replace("/", "__").replace("\\", "__")
                     local_path = os.path.join(tmp_dir, safe_name)
 
-                    raw = blob_client.download_blob().readall()
-                    with open(local_path, "wb") as fh:
-                        fh.write(raw)
-
+                    size_bytes = await asyncio.to_thread(
+                        _download_blob_to_disk, blob_client, local_path
+                    )
                     downloaded_files.append(local_path)
-                    size_kb = len(raw) / 1024
+                    local_paths.append(local_path)
                     yield _log(
-                        f"[{stage}] Saved → {local_path}  ({size_kb:.1f} KB)",
+                        f"[{stage}] Saved → {local_path}  ({size_bytes / 1024:.1f} KB)",
                         "success",
                     )
 
-                    df = pd.read_csv(local_path)
-                    yield _log(
-                        f"[{stage}] {blob_name}: {len(df)} rows, {len(df.columns)} columns."
-                    )
-                    dfs.append(df)
-
-                yield _log(f"[{stage}] Merging {len(dfs)} file(s)…")
-                merged = pd.concat(dfs, ignore_index=True)
-                yield _log(f"[{stage}] {len(merged)} rows after merge.", "success")
-
-                # Apply filters (AND: sequential reduction; OR: union of individual results)
-                active_filters = [f for f in request.filters if f.column and f.value]
-                if active_filters:
-                    if request.filter_logic == "OR":
-                        parts: List[pd.DataFrame] = []
-                        for f in active_filters:
-                            if f.column not in merged.columns:
-                                yield _log(
-                                    f"[{stage}] Filter column '{f.column}' not found — skipped.",
-                                    "warning",
-                                )
-                                continue
-                            try:
-                                part = _apply_single_filter(merged, f)
-                                parts.append(part)
-                                yield _log(
-                                    f"[{stage}] Filter '{f.column} {'~' if f.filter_type == 'regex' else '='} {f.value}'"
-                                    f" matched {len(part)} row(s)."
-                                )
-                            except ValueError as exc:
-                                yield _log(f"[{stage}] {exc} — skipped.", "warning")
-                        if parts:
-                            merged = pd.concat(parts).drop_duplicates()
-                        yield _log(
-                            f"[{stage}] OR filter → {len(merged)} rows remain.", "success"
-                        )
-                    else:  # AND
-                        for f in active_filters:
-                            if f.column not in merged.columns:
-                                yield _log(
-                                    f"[{stage}] Filter column '{f.column}' not found — skipped.",
-                                    "warning",
-                                )
-                                continue
-                            before = len(merged)
-                            try:
-                                merged = _apply_single_filter(merged, f)
-                            except ValueError as exc:
-                                yield _log(f"[{stage}] {exc} — skipped.", "warning")
-                                continue
-                            yield _log(
-                                f"[{stage}] Filter '{f.column} {'~' if f.filter_type == 'regex' else '='} {f.value}'"
-                                f" → {len(merged)} rows remain (was {before})."
-                            )
-
-                # Deduplication
-                if request.deduplicate:
-                    valid_keys = [k for k in request.key_columns if k in merged.columns]
-                    if valid_keys:
-                        before = len(merged)
-                        merged = merged.drop_duplicates(subset=valid_keys, keep="first")
-                        after = len(merged)
-                        if before > after:
-                            removed = before - after
-                            dedup_warnings[stage] = {"removed": removed, "kept": after}
-                            yield _log(
-                                f"[{stage}] Deduplicated: {removed} duplicate(s) removed,"
-                                f" {after} row(s) kept.",
-                                "warning",
-                            )
-                        else:
-                            yield _log(f"[{stage}] No duplicates found.")
-
+                yield _log(f"[{stage}] Merging and processing {len(local_paths)} file(s)…")
+                merged, dedup_info, stage_logs = await asyncio.to_thread(
+                    _process_stage_sync,
+                    local_paths,
+                    active_filters,
+                    request.filter_logic,
+                    request.deduplicate,
+                    request.key_columns,
+                )
+                for level, msg in stage_logs:
+                    yield _log(f"[{stage}] {msg}", level)
+                if dedup_info:
+                    dedup_warnings[stage] = dedup_info
                 stage_dfs[stage] = merged
 
-            # ── 3. Collect all unique key tuples ──────────────────────────────
+            # ── 3. Build flow report ───────────────────────────────────────────
             yield _log("Building flow report…")
-
-            all_key_tuples: set = set()
-            for stage, df in stage_dfs.items():
-                valid_keys = [k for k in request.key_columns if k in df.columns]
-                if not valid_keys:
-                    continue
-                for _, row in df.iterrows():
-                    key_tuple = tuple((k, str(row[k])) for k in valid_keys)
-                    all_key_tuples.add(key_tuple)
-
-            yield _log(
-                f"Found {len(all_key_tuples)} unique record(s) matching the filters."
-            )
-
-            # ── 4. Build per-record flow ───────────────────────────────────────
             ordered_stages = (
                 [s for s in STAGE_ORDER if s in stage_dfs]
                 + [s for s in stage_dfs if s not in STAGE_ORDER]
             )
 
-            rows = []
-            for key_tuple in sorted(all_key_tuples):
-                key_dict = dict(key_tuple)
-                flow: Dict[str, Any] = {}
-                missing_stages: List[str] = []
-                last_seen_stage: Optional[str] = None
-
-                for stage in ordered_stages:
-                    df = stage_dfs[stage]
-                    valid_keys = [k for k in request.key_columns if k in df.columns]
-
-                    if not valid_keys:
-                        missing_stages.append(stage)
-                        continue
-
-                    mask = pd.Series(True, index=df.index)
-                    for k in valid_keys:
-                        if k in key_dict:
-                            mask &= df[k].astype(str) == key_dict[k]
-
-                    matches = df[mask]
-                    if matches.empty:
-                        missing_stages.append(stage)
-                    else:
-                        flow[stage] = json.loads(
-                            matches.iloc[[0]].to_json(orient="records")
-                        )[0]
-                        last_seen_stage = stage
-
-                rows.append({
-                    "key_value": key_dict,
-                    "flow": flow,
-                    "missing_stages": missing_stages,
-                    "last_seen_stage": last_seen_stage,
-                    "dedup_warnings": {
-                        s: dedup_warnings[s] for s in dedup_warnings if s in flow
-                    },
-                })
-
-            columns_per_stage = {
-                stage: list(df.columns) for stage, df in stage_dfs.items()
-            }
+            rows, columns_per_stage = await asyncio.to_thread(
+                _build_flow_report, stage_dfs, request.key_columns, ordered_stages, dedup_warnings
+            )
 
             yield _log(
-                f"Done — {len(rows)} record(s) traced across"
-                f" {len(ordered_stages)} stage(s).",
+                f"Done — {len(rows)} record(s) traced across {len(ordered_stages)} stage(s).",
                 "success",
             )
 
-            # ── 5. Emit final result ───────────────────────────────────────────
+            # ── 4. Emit final result ───────────────────────────────────────────
             yield _sse({
                 "type": "result",
                 "data": {
