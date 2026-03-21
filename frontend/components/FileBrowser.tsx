@@ -209,7 +209,7 @@ export default function FileBrowser({
       result = result
         .map((g) => ({
           ...g,
-          blobs: g.blobs.filter((b) => b.last_modified === dateFilter),
+          blobs: g.blobs.filter((b) => (b.last_modified ?? "") >= dateFilter),
         }))
         .filter((g) => g.blobs.length > 0);
     }

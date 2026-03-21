@@ -49,14 +49,14 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
     return result;
   }, [resources, blobs]);
 
-  // Filtered blobs per resource (applying the date filter)
+  // Filtered blobs per resource (keep files with last_modified >= selected date)
   const filteredBlobsByResource = useMemo(() => {
     const result: Record<string, BlobInfo[]> = {};
     for (const r of resources) {
       const matching = blobs.filter((b) => b.name.startsWith(r.technical_name));
       const dateFilter = dateFilters[r.id];
       result[r.id] = dateFilter
-        ? matching.filter((b) => b.last_modified === dateFilter)
+        ? matching.filter((b) => (b.last_modified ?? "") >= dateFilter)
         : matching;
     }
     return result;
@@ -278,26 +278,26 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
                   </div>
                 )}
 
-                {/* Matching file list */}
+                {/* Stage counts */}
                 {!isEditing && filteredBlobs.length > 0 && (
                   <div className="px-4 pb-3">
-                    <div className="border border-gray-100 rounded-lg overflow-hidden">
-                      {filteredBlobs.map((b) => (
-                        <div
-                          key={b.name}
-                          className="flex items-center gap-2 px-3 py-1.5 text-xs border-b border-gray-50 last:border-b-0"
-                        >
-                          <span className="font-mono text-gray-600 flex-1 truncate min-w-0" title={b.name}>
-                            {b.name.split("/").pop()}
+                    <div className="flex flex-wrap gap-2">
+                      {Object.entries(
+                        filteredBlobs.reduce<Record<string, number>>((acc, b) => {
+                          const stage = b.detected_stage ?? "unknown";
+                          acc[stage] = (acc[stage] ?? 0) + 1;
+                          return acc;
+                        }, {})
+                      )
+                        .sort(([a], [b]) => a.localeCompare(b))
+                        .map(([stage, count]) => (
+                          <span
+                            key={stage}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-gray-100 text-gray-600"
+                          >
+                            <span className="font-medium">{count}</span> {stage}
                           </span>
-                          <span className="text-gray-400 flex-shrink-0">
-                            {b.detected_stage ?? "unknown"}
-                          </span>
-                          <span className="text-gray-300 flex-shrink-0">
-                            {b.last_modified ? new Date(b.last_modified).toLocaleString() : "—"}
-                          </span>
-                        </div>
-                      ))}
+                        ))}
                     </div>
                   </div>
                 )}
