@@ -43,13 +43,15 @@ export interface LogEntry {
 export async function listBlobs(
   containerUrl: string,
   dateFrom?: string,
-  dateTo?: string
+  dateTo?: string,
+  prefix?: string,
 ): Promise<BlobInfo[]> {
   const res = await fetch(`${BASE_URL}/api/blobs/list`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       container_url: containerUrl,
+      ...(prefix && { prefix }),
       ...(dateFrom && { date_from: dateFrom }),
       ...(dateTo && { date_to: dateTo }),
     }),
@@ -59,6 +61,53 @@ export async function listBlobs(
     throw new Error(err.detail || "Failed to list blobs");
   }
   return res.json();
+}
+
+export interface Resource {
+  id: string;
+  technical_name: string;
+  business_name: string;
+  created_at: string;
+}
+
+export async function getResources(): Promise<Resource[]> {
+  const res = await fetch(`${BASE_URL}/api/resources`);
+  if (!res.ok) throw new Error("Failed to load resources");
+  return res.json();
+}
+
+export async function createResource(technical_name: string, business_name: string): Promise<Resource> {
+  const res = await fetch(`${BASE_URL}/api/resources`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ technical_name, business_name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to create resource");
+  }
+  return res.json();
+}
+
+export async function updateResource(id: string, technical_name: string, business_name: string): Promise<Resource> {
+  const res = await fetch(`${BASE_URL}/api/resources/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ technical_name, business_name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to update resource");
+  }
+  return res.json();
+}
+
+export async function deleteResource(id: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/resources/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to delete resource");
+  }
 }
 
 export interface BlobPreview {
@@ -96,6 +145,36 @@ export async function getBlobColumns(
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || "Failed to get columns");
+  }
+  return res.json();
+}
+
+export interface ColumnProfile {
+  name: string;
+  distinct_count: number;
+  value_counts: Record<string, number> | null;
+}
+
+export interface BlobProfile {
+  blob_name: string;
+  detected_stage: string;
+  row_count: number;
+  columns: ColumnProfile[];
+  error?: string;
+}
+
+export async function profileBlobs(
+  containerUrl: string,
+  blobNames: string[]
+): Promise<BlobProfile[]> {
+  const res = await fetch(`${BASE_URL}/api/blobs/profile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ container_url: containerUrl, blob_names: blobNames }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to profile blobs");
   }
   return res.json();
 }

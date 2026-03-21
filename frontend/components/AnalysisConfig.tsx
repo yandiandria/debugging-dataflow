@@ -1,6 +1,18 @@
-import { useState, useEffect } from "react";
-import { getBlobColumns, getBlobPreview } from "../lib/api";
-import type { FilterCondition, BlobPreview } from "../lib/api";
+import { useState, useEffect, useMemo } from "react";
+import { getBlobColumns, getBlobPreview, profileBlobs } from "../lib/api";
+import type { FilterCondition, BlobPreview, BlobProfile } from "../lib/api";
+
+const STAGE_ORDER = [
+  "extract",
+  "clean_cleaned",
+  "clean_incoherent",
+  "compare_and_identify_in_flow_only",
+  "compare_and_identify_in_flow_and_db_different",
+  "compare_and_identify_not_linked_mandatory",
+  "compare_and_identify_not_linked_optional",
+  "load",
+  "transform",
+];
 
 interface Props {
   containerUrl: string;
@@ -41,6 +53,15 @@ export default function AnalysisConfig({
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
+  // Right-panel tab
+  const [rightTab, setRightTab] = useState<"preview" | "volumetry">("preview");
+
+  // Volumetry state
+  const [profileData, setProfileData] = useState<BlobProfile[] | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [expandedBlobs, setExpandedBlobs] = useState<Set<string>>(new Set());
+
   // Load columns from the first selected blob
   useEffect(() => {
     if (selectedBlobs.length === 0) return;
@@ -62,6 +83,37 @@ export default function AnalysisConfig({
       .catch((e) => { setPreviewError(e.message); setPreviewLoading(false); });
   }, [containerUrl, previewBlob]);
 
+  const loadProfile = async () => {
+    setProfileLoading(true);
+    setProfileError(null);
+    try {
+      const data = await profileBlobs(containerUrl, selectedBlobs);
+      setProfileData(data);
+    } catch (e: unknown) {
+      setProfileError(e instanceof Error ? e.message : "Failed to load profile");
+    } finally {
+      setProfileLoading(false);
+    }
+  };
+
+  const stageGroups = useMemo(() => {
+    if (!profileData) return [];
+    const map = new Map<string, BlobProfile[]>();
+    for (const bp of profileData) {
+      if (!map.has(bp.detected_stage)) map.set(bp.detected_stage, []);
+      map.get(bp.detected_stage)!.push(bp);
+    }
+    const orderedKeys = [
+      ...STAGE_ORDER.filter((s) => map.has(s)),
+      ...[...map.keys()].filter((s) => !STAGE_ORDER.includes(s)),
+    ];
+    return orderedKeys.map((stage) => ({
+      stage,
+      profiles: map.get(stage)!,
+      totalRows: map.get(stage)!.reduce((sum, b) => sum + Math.max(b.row_count, 0), 0),
+    }));
+  }, [profileData]);
+
   const toggleKeyColumn = (col: string) => {
     setKeyColumns((prev) =>
       prev.includes(col) ? prev.filter((c) => c !== col) : [...prev, col]
@@ -81,10 +133,8 @@ export default function AnalysisConfig({
   const removeFilter = (idx: number) =>
     setFilters((prev) => prev.filter((_, i) => i !== idx));
 
-  /** Clicking a cell in the preview adds (or sets) a filter for that column. */
   const handleCellClick = (col: string, value: unknown) => {
     const strVal = value === null || value === undefined ? "" : String(value);
-    // Find an existing empty filter or a filter already on this column
     const existingIdx = filters.findIndex((f) => f.column === col || f.column === "");
     if (existingIdx !== -1) {
       setFilters((prev) => {
@@ -95,6 +145,15 @@ export default function AnalysisConfig({
     } else {
       setFilters((prev) => [...prev, { column: col, value: strVal, filter_type: "equals" }]);
     }
+  };
+
+  const toggleBlobExpand = (blobName: string) => {
+    setExpandedBlobs((prev) => {
+      const next = new Set(prev);
+      if (next.has(blobName)) next.delete(blobName);
+      else next.add(blobName);
+      return next;
+    });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -307,93 +366,276 @@ export default function AnalysisConfig({
           </form>
         </div>
 
-        {/* ── Right: data preview ──────────────────────────────────────────── */}
+        {/* ── Right: tabbed panel ───────────────────────────────────────────── */}
         <div className="flex-1 flex flex-col overflow-hidden p-4 gap-3">
-          {/* Preview toolbar */}
-          <div className="flex items-center gap-3 flex-shrink-0">
-            <span className="text-sm font-medium text-gray-700">Preview</span>
-            <select
-              value={previewBlob}
-              onChange={(e) => setPreviewBlob(e.target.value)}
-              className="border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 max-w-lg font-mono"
-            >
-              {selectedBlobs.map((b) => (
-                <option key={b} value={b}>{b}</option>
-              ))}
-            </select>
-            {preview && (
-              <span className="text-xs text-gray-400">
-                {preview.total_rows_loaded} rows · {preview.columns.length} columns
-              </span>
+
+          {/* Tab bar + contextual toolbar */}
+          <div className="flex items-center gap-3 flex-shrink-0 flex-wrap">
+            {/* Tabs */}
+            <div className="flex rounded-lg border border-gray-200 bg-gray-50 p-0.5 gap-0.5 flex-shrink-0">
+              <button
+                onClick={() => setRightTab("preview")}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  rightTab === "preview"
+                    ? "bg-white text-gray-800 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                Preview
+              </button>
+              <button
+                onClick={() => setRightTab("volumetry")}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  rightTab === "volumetry"
+                    ? "bg-white text-gray-800 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                Volumetry
+              </button>
+            </div>
+
+            {/* Preview toolbar */}
+            {rightTab === "preview" && (
+              <>
+                <select
+                  value={previewBlob}
+                  onChange={(e) => setPreviewBlob(e.target.value)}
+                  className="border border-gray-300 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 max-w-lg font-mono"
+                >
+                  {selectedBlobs.map((b) => (
+                    <option key={b} value={b}>{b}</option>
+                  ))}
+                </select>
+                {preview && (
+                  <span className="text-xs text-gray-400">
+                    {preview.total_rows_loaded} rows · {preview.columns.length} columns
+                  </span>
+                )}
+              </>
+            )}
+
+            {/* Volumetry toolbar */}
+            {rightTab === "volumetry" && (
+              profileLoading ? (
+                <span className="text-xs text-gray-400">Profiling {selectedBlobs.length} file(s)…</span>
+              ) : (
+                <button
+                  onClick={loadProfile}
+                  className="text-xs px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition-colors"
+                >
+                  {profileData ? "Refresh" : "Load data profile"}
+                </button>
+              )
             )}
           </div>
 
-          {/* Preview table */}
-          <div className="flex-1 overflow-auto border border-gray-200 rounded-xl bg-white">
-            {previewLoading && (
-              <div className="flex items-center justify-center h-full text-sm text-gray-400">
-                Loading preview…
-              </div>
-            )}
-            {previewError && (
-              <div className="flex items-center justify-center h-full text-sm text-red-500 p-4">
-                {previewError}
-              </div>
-            )}
-            {preview && !previewLoading && (
-              <table className="w-full text-xs">
-                <thead className="bg-gray-50 sticky top-0 z-10 border-b border-gray-200">
-                  <tr>
-                    {preview.columns.map((col) => (
-                      <th
-                        key={col}
-                        className={`px-3 py-2 text-left font-medium whitespace-nowrap border-r border-gray-100 last:border-r-0 ${
-                          filters.some((f) => f.column === col)
-                            ? "text-blue-700 bg-blue-50"
-                            : "text-gray-600"
-                        }`}
-                      >
-                        {col}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {preview.rows.map((row, i) => (
-                    <tr
-                      key={i}
-                      className="border-t border-gray-100 hover:bg-gray-50"
-                    >
-                      {preview.columns.map((col) => {
-                        const val = row[col];
-                        const isFiltered = filters.some(
-                          (f) => f.column === col && f.value === String(val ?? "")
-                        );
-                        return (
-                          <td
-                            key={col}
-                            onClick={() => handleCellClick(col, val)}
-                            title="Click to use as filter"
-                            className={`px-3 py-1.5 border-r border-gray-100 last:border-r-0 cursor-pointer whitespace-nowrap max-w-xs truncate transition-colors ${
-                              isFiltered
-                                ? "bg-blue-50 text-blue-700 font-medium"
-                                : "text-gray-700 hover:bg-blue-50 hover:text-blue-700"
-                            }`}
-                          >
-                            {val === null || val === undefined ? (
-                              <span className="text-gray-300 italic">null</span>
-                            ) : (
-                              String(val)
-                            )}
-                          </td>
-                        );
-                      })}
+          {/* Preview panel */}
+          {rightTab === "preview" && (
+            <div className="flex-1 overflow-auto border border-gray-200 rounded-xl bg-white">
+              {previewLoading && (
+                <div className="flex items-center justify-center h-full text-sm text-gray-400">
+                  Loading preview…
+                </div>
+              )}
+              {previewError && (
+                <div className="flex items-center justify-center h-full text-sm text-red-500 p-4">
+                  {previewError}
+                </div>
+              )}
+              {preview && !previewLoading && (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50 sticky top-0 z-10 border-b border-gray-200">
+                    <tr>
+                      {preview.columns.map((col) => (
+                        <th
+                          key={col}
+                          className={`px-3 py-2 text-left font-medium whitespace-nowrap border-r border-gray-100 last:border-r-0 ${
+                            filters.some((f) => f.column === col)
+                              ? "text-blue-700 bg-blue-50"
+                              : "text-gray-600"
+                          }`}
+                        >
+                          {col}
+                        </th>
+                      ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
+                  </thead>
+                  <tbody>
+                    {preview.rows.map((row, i) => (
+                      <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+                        {preview.columns.map((col) => {
+                          const val = row[col];
+                          const isFiltered = filters.some(
+                            (f) => f.column === col && f.value === String(val ?? "")
+                          );
+                          return (
+                            <td
+                              key={col}
+                              onClick={() => handleCellClick(col, val)}
+                              title="Click to use as filter"
+                              className={`px-3 py-1.5 border-r border-gray-100 last:border-r-0 cursor-pointer whitespace-nowrap max-w-xs truncate transition-colors ${
+                                isFiltered
+                                  ? "bg-blue-50 text-blue-700 font-medium"
+                                  : "text-gray-700 hover:bg-blue-50 hover:text-blue-700"
+                              }`}
+                            >
+                              {val === null || val === undefined ? (
+                                <span className="text-gray-300 italic">null</span>
+                              ) : (
+                                String(val)
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+
+          {/* Volumetry panel */}
+          {rightTab === "volumetry" && (
+            <div className="flex-1 overflow-auto border border-gray-200 rounded-xl bg-white">
+              {profileError && (
+                <div className="p-4 text-sm text-red-600">{profileError}</div>
+              )}
+              {!profileData && !profileLoading && !profileError && (
+                <div className="flex flex-col items-center justify-center h-full gap-3 text-sm text-gray-400">
+                  <p>Profile {selectedBlobs.length} selected file(s) to see row counts and column cardinality.</p>
+                  <button
+                    onClick={loadProfile}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm transition-colors"
+                  >
+                    Load data profile
+                  </button>
+                </div>
+              )}
+              {profileLoading && (
+                <div className="flex items-center justify-center h-full text-sm text-gray-400">
+                  Profiling {selectedBlobs.length} file(s)…
+                </div>
+              )}
+              {profileData && !profileLoading && (
+                <div className="p-4 space-y-6">
+                  {stageGroups.map((group, i) => {
+                    const prevGroup = i > 0 ? stageGroups[i - 1] : null;
+                    const pct =
+                      prevGroup && prevGroup.totalRows > 0
+                        ? ((group.totalRows - prevGroup.totalRows) / prevGroup.totalRows) * 100
+                        : null;
+
+                    return (
+                      <div key={group.stage}>
+                        {/* Stage header */}
+                        <div className="flex items-center gap-3 mb-2 pb-1.5 border-b border-gray-100">
+                          <span className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+                            {group.stage}
+                          </span>
+                          <span className="text-sm font-mono font-semibold text-gray-800">
+                            {group.totalRows.toLocaleString()} rows
+                          </span>
+                          {pct !== null && (
+                            <span
+                              className={`text-xs font-medium px-1.5 py-0.5 rounded-full ${
+                                Math.abs(pct) < 0.05
+                                  ? "text-gray-500 bg-gray-100"
+                                  : pct < 0
+                                  ? "text-red-600 bg-red-50"
+                                  : "text-green-600 bg-green-50"
+                              }`}
+                            >
+                              {Math.abs(pct) < 0.05
+                                ? "="
+                                : `${pct > 0 ? "+" : ""}${pct.toFixed(1)}%`}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Files in stage */}
+                        <div className="space-y-2 ml-2">
+                          {group.profiles.map((bp) => {
+                            const filename = bp.blob_name.split("/").pop() ?? bp.blob_name;
+                            const isExpanded = expandedBlobs.has(bp.blob_name);
+
+                            return (
+                              <div
+                                key={bp.blob_name}
+                                className="border border-gray-100 rounded-lg overflow-hidden"
+                              >
+                                {/* File header — clickable to expand */}
+                                <button
+                                  onClick={() => toggleBlobExpand(bp.blob_name)}
+                                  className="w-full flex items-center gap-2 px-3 py-2 bg-gray-50 hover:bg-gray-100 transition-colors text-left"
+                                >
+                                  <span className="text-gray-400 text-xs w-3 flex-shrink-0">
+                                    {isExpanded ? "▼" : "▶"}
+                                  </span>
+                                  <span
+                                    className="text-xs font-mono text-gray-700 flex-1 truncate min-w-0"
+                                    title={bp.blob_name}
+                                  >
+                                    {filename}
+                                  </span>
+                                  {bp.error ? (
+                                    <span className="text-xs text-red-500 flex-shrink-0">error</span>
+                                  ) : (
+                                    <span className="text-xs font-medium text-gray-600 flex-shrink-0">
+                                      {bp.row_count.toLocaleString()} rows · {bp.columns.length} cols
+                                    </span>
+                                  )}
+                                </button>
+
+                                {/* Expanded: columns */}
+                                {isExpanded && bp.error && (
+                                  <div className="px-3 py-2 text-xs text-red-600 bg-red-50">
+                                    {bp.error}
+                                  </div>
+                                )}
+                                {isExpanded && !bp.error && (
+                                  <div className="divide-y divide-gray-50">
+                                    {bp.columns.map((col) => (
+                                      <div key={col.name} className="px-3 py-2">
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-xs font-mono text-gray-800 flex-1 truncate min-w-0">
+                                            {col.name}
+                                          </span>
+                                          <span className="text-xs text-gray-400 flex-shrink-0">
+                                            {col.distinct_count.toLocaleString()} distinct
+                                          </span>
+                                        </div>
+                                        {col.value_counts && (
+                                          <div className="flex flex-wrap gap-1 mt-1.5 ml-1">
+                                            {Object.entries(col.value_counts)
+                                              .sort(([, a], [, b]) => b - a)
+                                              .map(([val, count]) => (
+                                                <span
+                                                  key={val}
+                                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-gray-100 rounded text-xs"
+                                                >
+                                                  <span className="font-mono text-gray-700">{val}</span>
+                                                  <span className="text-gray-400">({count.toLocaleString()})</span>
+                                                </span>
+                                              ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -3,6 +3,9 @@ import json
 import os
 import re
 import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import pandas as pd
@@ -63,10 +66,38 @@ app.add_middleware(
 )
 
 
+# ── Resource persistence ────────────────────────────────────────────────────────
+
+RESOURCES_FILE = Path(__file__).parent / "resources.json"
+
+
+def _load_resources() -> List[Dict]:
+    if not RESOURCES_FILE.exists():
+        return []
+    return json.loads(RESOURCES_FILE.read_text())
+
+
+def _save_resources(resources: List[Dict]) -> None:
+    RESOURCES_FILE.write_text(json.dumps(resources, indent=2))
+
+
 # ── Models ─────────────────────────────────────────────────────────────────────
+
+class Resource(BaseModel):
+    id: str
+    technical_name: str
+    business_name: str
+    created_at: str
+
+
+class ResourceCreate(BaseModel):
+    technical_name: str
+    business_name: str
+
 
 class BlobListRequest(BaseModel):
     container_url: str
+    prefix: Optional[str] = None     # Azure-side path prefix filter
     date_from: Optional[str] = None  # ISO date string, e.g. "2024-01-15"
     date_to: Optional[str] = None    # ISO date string, inclusive
 
@@ -104,11 +135,59 @@ class PreviewRequest(BaseModel):
     limit: int = 200
 
 
+class ProfileRequest(BaseModel):
+    container_url: str
+    blob_names: List[str]
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+# ── Resource endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/api/resources")
+async def list_resources() -> List[Resource]:
+    return [Resource(**r) for r in _load_resources()]
+
+
+@app.post("/api/resources", status_code=201)
+async def create_resource(body: ResourceCreate) -> Resource:
+    resources = _load_resources()
+    resource = Resource(
+        id=str(uuid.uuid4()),
+        technical_name=body.technical_name,
+        business_name=body.business_name,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    resources.append(resource.model_dump())
+    _save_resources(resources)
+    return resource
+
+
+@app.put("/api/resources/{resource_id}")
+async def update_resource(resource_id: str, body: ResourceCreate) -> Resource:
+    resources = _load_resources()
+    for i, r in enumerate(resources):
+        if r["id"] == resource_id:
+            r["technical_name"] = body.technical_name
+            r["business_name"] = body.business_name
+            resources[i] = r
+            _save_resources(resources)
+            return Resource(**r)
+    raise HTTPException(status_code=404, detail="Resource not found")
+
+
+@app.delete("/api/resources/{resource_id}", status_code=204)
+async def delete_resource(resource_id: str):
+    resources = _load_resources()
+    updated = [r for r in resources if r["id"] != resource_id]
+    if len(updated) == len(resources):
+        raise HTTPException(status_code=404, detail="Resource not found")
+    _save_resources(updated)
 
 
 @app.post("/api/blobs/list")
@@ -127,7 +206,7 @@ async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
 
         client = build_container_client(request.container_url)
         blobs: List[BlobInfo] = []
-        for blob in client.list_blobs():
+        for blob in client.list_blobs(name_starts_with=request.prefix or None):
             if not blob.name.lower().endswith(".csv"):
                 continue
             lm = blob.last_modified
@@ -181,6 +260,53 @@ async def preview_blob(request: PreviewRequest):
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/blobs/profile")
+async def profile_blobs(request: ProfileRequest) -> List[Dict]:
+    """Return row count and per-column cardinality for each blob."""
+    try:
+        client = build_container_client(request.container_url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    results = []
+    for blob_name in request.blob_names:
+        try:
+            raw = client.get_blob_client(blob_name).download_blob().readall()
+            df = pd.read_csv(io.BytesIO(raw))
+
+            col_profiles = []
+            for col in df.columns:
+                distinct = int(df[col].nunique(dropna=False))
+                vc = None
+                if distinct < 10:
+                    series = df[col].value_counts(dropna=False)
+                    vc = {}
+                    for k, v in series.items():
+                        key = "null" if (k is None or (isinstance(k, float) and pd.isna(k))) else str(k)
+                        vc[key] = int(v)
+                col_profiles.append({
+                    "name": col,
+                    "distinct_count": distinct,
+                    "value_counts": vc,
+                })
+
+            results.append({
+                "blob_name": blob_name,
+                "detected_stage": detect_stage(blob_name) or "unknown",
+                "row_count": len(df),
+                "columns": col_profiles,
+            })
+        except Exception as e:
+            results.append({
+                "blob_name": blob_name,
+                "detected_stage": detect_stage(blob_name) or "unknown",
+                "row_count": -1,
+                "columns": [],
+                "error": str(e),
+            })
+    return results
 
 
 def _apply_single_filter(df: pd.DataFrame, f: FilterCondition) -> pd.DataFrame:

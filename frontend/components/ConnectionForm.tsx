@@ -1,18 +1,20 @@
 import { useState, useEffect } from "react";
 
 const STORAGE_KEY = "dataflow_container_url";
+const STORAGE_PREFIX_KEY = "dataflow_prefix";
 
 interface Props {
-  onConnect: (containerUrl: string, dateFrom?: string, dateTo?: string) => void;
+  onConnect: (containerUrl: string, dateFrom?: string, dateTo?: string, prefix?: string) => void;
   loading: boolean;
   error: string | null;
 }
 
 export default function ConnectionForm({ onConnect, loading, error }: Props) {
   const [containerUrl, setContainerUrl] = useState(() =>
-    typeof window !== "undefined"
-      ? localStorage.getItem(STORAGE_KEY) ?? ""
-      : ""
+    typeof window !== "undefined" ? localStorage.getItem(STORAGE_KEY) ?? "" : ""
+  );
+  const [prefix, setPrefix] = useState(() =>
+    typeof window !== "undefined" ? localStorage.getItem(STORAGE_PREFIX_KEY) ?? "" : ""
   );
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -22,7 +24,9 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
     const url = containerUrl.trim();
     if (url) {
       localStorage.setItem(STORAGE_KEY, url);
-      onConnect(url, dateFrom || undefined, dateTo || undefined);
+      if (prefix.trim()) localStorage.setItem(STORAGE_PREFIX_KEY, prefix.trim());
+      else localStorage.removeItem(STORAGE_PREFIX_KEY);
+      onConnect(url, dateFrom || undefined, dateTo || undefined, prefix.trim() || undefined);
     }
   };
 
@@ -65,6 +69,22 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
                 </button>
               )}
             </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Path prefix <span className="text-gray-400 font-normal">(optional)</span>
+            </label>
+            <input
+              type="text"
+              className="w-full border border-gray-300 rounded-lg p-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500"
+              placeholder="e.g. flow/airflow/data/"
+              value={prefix}
+              onChange={(e) => setPrefix(e.target.value)}
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              Filters blobs at the Azure level — use this to speed up listing on large containers.
+            </p>
           </div>
 
           <div>

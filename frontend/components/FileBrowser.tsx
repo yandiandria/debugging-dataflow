@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import type { BlobInfo } from "../lib/api";
+import type { BlobInfo, Resource } from "../lib/api";
 
 const STAGE_COLORS: Record<string, string> = {
   extract: "bg-purple-100 text-purple-700",
@@ -15,22 +15,13 @@ const STAGE_COLORS: Record<string, string> = {
 };
 
 /**
- * Build a map from each blob name → its group prefix.
- *
- * Algorithm:
- *  1. Collect the stems of all extract-stage blobs (full path without .csv).
- *  2. For every blob, find the longest extract stem that is a prefix of its name.
- *  3. If none matches, fall back to the blob's own stem.
- *
- * Example:
- *   extract blob  → "flow/data/amt_owner.csv"  → stem "flow/data/amt_owner"
- *   other blob    → "flow/data/amt_owner_clean_cleaned.csv" → matches stem → same group
+ * Build a map from each blob name → its group prefix (stem of the extract blob).
  */
 function buildGroupPrefixMap(allBlobs: BlobInfo[]): Map<string, string> {
   const extractStems = allBlobs
     .filter((b) => b.detected_stage === "extract")
     .map((b) => b.name.replace(/\.csv$/i, ""))
-    .sort((a, b) => b.length - a.length); // longest first → most specific wins
+    .sort((a, b) => b.length - a.length);
 
   const map = new Map<string, string>();
   for (const blob of allBlobs) {
@@ -56,13 +47,12 @@ function formatDate(iso: string): string {
 }
 
 interface GroupKey {
-  date: string;   // YYYY-MM-DD
+  date: string;
   suffix: string;
 }
 
 interface BlobGroup {
   key: GroupKey;
-  label: string;
   blobs: BlobInfo[];
 }
 
@@ -72,6 +62,9 @@ interface Props {
   onSelectionChange: (selected: Set<string>) => void;
   onAnalyze: () => void;
   onDisconnect: () => void;
+  resources: Resource[];
+  onAssignResource: (technicalName: string, businessName: string) => Promise<void>;
+  onManageResources: () => void;
 }
 
 export default function FileBrowser({
@@ -80,15 +73,33 @@ export default function FileBrowser({
   onSelectionChange,
   onAnalyze,
   onDisconnect,
+  resources,
+  onAssignResource,
+  onManageResources,
 }: Props) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState<string>("all");
+  const [resourceFilter, setResourceFilter] = useState<string>("all");
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+
+  // assign form state: key of the group being assigned
+  const [assigningGroup, setAssigningGroup] = useState<string | null>(null);
+  const [assignBusiness, setAssignBusiness] = useState("");
+  const [assignTechnical, setAssignTechnical] = useState("");
+  const [assignExisting, setAssignExisting] = useState("");
+  const [assignSaving, setAssignSaving] = useState(false);
 
   const stages = useMemo(() => {
     const s = new Set(blobs.map((b) => b.detected_stage ?? "unknown"));
     return ["all", ...Array.from(s).sort()];
   }, [blobs]);
+
+  // Map technical_name → resource for fast lookup
+  const resourceByTechnical = useMemo(() => {
+    const m = new Map<string, Resource>();
+    for (const r of resources) m.set(r.technical_name, r);
+    return m;
+  }, [resources]);
 
   const filtered = useMemo(() => {
     return blobs.filter((b) => {
@@ -99,34 +110,39 @@ export default function FileBrowser({
     });
   }, [blobs, search, stageFilter]);
 
-  // Build prefix map from ALL blobs so stage-filter doesn't break grouping
   const groupPrefixMap = useMemo(() => buildGroupPrefixMap(blobs), [blobs]);
 
-  const groups = useMemo((): BlobGroup[] => {
+  const allGroups = useMemo((): BlobGroup[] => {
     const map = new Map<string, BlobGroup>();
-
     for (const blob of filtered) {
       const prefix = groupPrefixMap.get(blob.name) ?? blob.name.replace(/\.csv$/i, "");
       const date = blob.last_modified ? blob.last_modified.slice(0, 10) : "unknown";
       const key = `${prefix}__${date}`;
-      const displayName = prefix.split("/").pop() ?? prefix;
-
       if (!map.has(key)) {
-        map.set(key, {
-          key: { date, suffix: prefix },
-          label: `${displayName}  ·  ${formatDate(blob.last_modified)}`,
-          blobs: [],
-        });
+        map.set(key, { key: { date, suffix: prefix }, blobs: [] });
       }
       map.get(key)!.blobs.push(blob);
     }
-
-    return Array.from(map.values()).sort((a, b) => {
-      // Sort by date descending, then prefix ascending
-      if (b.key.date !== a.key.date) return b.key.date.localeCompare(a.key.date);
+    const groups = Array.from(map.values());
+    // Sort blobs within each group newest first
+    for (const g of groups) {
+      g.blobs.sort((a, b) => (b.last_modified ?? "").localeCompare(a.last_modified ?? ""));
+    }
+    // Sort groups by their most recent blob's full timestamp, then by suffix
+    return groups.sort((a, b) => {
+      const aMax = a.blobs[0]?.last_modified ?? "";
+      const bMax = b.blobs[0]?.last_modified ?? "";
+      if (bMax !== aMax) return bMax.localeCompare(aMax);
       return a.key.suffix.localeCompare(b.key.suffix);
     });
   }, [filtered, groupPrefixMap]);
+
+  const groups = useMemo(() => {
+    if (resourceFilter === "all") return allGroups;
+    const res = resources.find((r) => r.id === resourceFilter);
+    if (!res) return allGroups;
+    return allGroups.filter((g) => g.key.suffix === res.technical_name);
+  }, [allGroups, resourceFilter, resources]);
 
   const toggleOne = (name: string) => {
     const next = new Set(selected);
@@ -136,24 +152,22 @@ export default function FileBrowser({
   };
 
   const toggleGroup = (group: BlobGroup) => {
-    const allSelected = group.blobs.every((b) => selected.has(b.name));
+    const allSel = group.blobs.every((b) => selected.has(b.name));
     const next = new Set(selected);
-    if (allSelected) {
-      group.blobs.forEach((b) => next.delete(b.name));
-    } else {
-      group.blobs.forEach((b) => next.add(b.name));
-    }
+    if (allSel) group.blobs.forEach((b) => next.delete(b.name));
+    else group.blobs.forEach((b) => next.add(b.name));
     onSelectionChange(next);
   };
 
   const toggleAll = () => {
-    if (filtered.every((b) => selected.has(b.name))) {
+    const visibleBlobs = groups.flatMap((g) => g.blobs);
+    if (visibleBlobs.every((b) => selected.has(b.name))) {
       const next = new Set(selected);
-      filtered.forEach((b) => next.delete(b.name));
+      visibleBlobs.forEach((b) => next.delete(b.name));
       onSelectionChange(next);
     } else {
       const next = new Set(selected);
-      filtered.forEach((b) => next.add(b.name));
+      visibleBlobs.forEach((b) => next.add(b.name));
       onSelectionChange(next);
     }
   };
@@ -167,20 +181,62 @@ export default function FileBrowser({
     });
   };
 
+  const openAssignForm = (groupKeyStr: string, suffix: string) => {
+    setAssigningGroup(groupKeyStr);
+    setAssignTechnical(suffix);
+    setAssignBusiness("");
+    setAssignExisting("");
+  };
+
+  const cancelAssign = () => {
+    setAssigningGroup(null);
+    setAssignBusiness("");
+    setAssignTechnical("");
+    setAssignExisting("");
+  };
+
+  const saveAssign = async () => {
+    const techName = assignTechnical.trim();
+    const busName = assignBusiness.trim();
+    if (!techName || !busName) return;
+    setAssignSaving(true);
+    try {
+      await onAssignResource(techName, busName);
+      cancelAssign();
+    } finally {
+      setAssignSaving(false);
+    }
+  };
+
+  const linkExisting = async () => {
+    if (!assignExisting) return;
+    const res = resources.find((r) => r.id === assignExisting);
+    if (!res) return;
+    setAssignSaving(true);
+    try {
+      // Update the resource's technical_name to this group's suffix
+      await onAssignResource(assignTechnical.trim(), res.business_name);
+      cancelAssign();
+    } finally {
+      setAssignSaving(false);
+    }
+  };
+
+  const visibleBlobs = groups.flatMap((g) => g.blobs);
   const allFilteredSelected =
-    filtered.length > 0 && filtered.every((b) => selected.has(b.name));
+    visibleBlobs.length > 0 && visibleBlobs.every((b) => selected.has(b.name));
 
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar */}
       <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-        <div className="flex items-center gap-2 flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-1 min-w-0 flex-wrap">
           <input
             type="text"
             placeholder="Search files…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 min-w-0"
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 min-w-32"
           />
           <select
             value={stageFilter}
@@ -188,13 +244,27 @@ export default function FileBrowser({
             className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             {stages.map((s) => (
-              <option key={s} value={s}>
-                {s === "all" ? "All stages" : s}
-              </option>
+              <option key={s} value={s}>{s === "all" ? "All stages" : s}</option>
+            ))}
+          </select>
+          <select
+            value={resourceFilter}
+            onChange={(e) => setResourceFilter(e.target.value)}
+            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="all">All resources</option>
+            {resources.map((r) => (
+              <option key={r.id} value={r.id}>{r.business_name}</option>
             ))}
           </select>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={onManageResources}
+            className="text-xs text-gray-500 hover:text-gray-700 px-3 py-2 rounded-lg border border-gray-200 hover:border-gray-300 transition-colors"
+          >
+            Manage resources
+          </button>
           <span className="text-sm text-gray-500">{selected.size} selected</span>
           <button
             onClick={onAnalyze}
@@ -225,15 +295,14 @@ export default function FileBrowser({
           const isCollapsed = collapsedGroups.has(groupKeyStr);
           const allGroupSelected = group.blobs.every((b) => selected.has(b.name));
           const someGroupSelected = group.blobs.some((b) => selected.has(b.name));
+          const linkedResource = resourceByTechnical.get(group.key.suffix);
+          const isAssigning = assigningGroup === groupKeyStr;
 
           return (
-            <div
-              key={groupKeyStr}
-              className="border border-gray-200 rounded-xl overflow-hidden"
-            >
+            <div key={groupKeyStr} className="border border-gray-200 rounded-xl overflow-hidden">
               {/* Group header */}
               <div className="bg-gray-50 px-4 py-2.5 flex items-center justify-between gap-3 border-b border-gray-200">
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 min-w-0">
                   <input
                     type="checkbox"
                     checked={allGroupSelected}
@@ -241,22 +310,39 @@ export default function FileBrowser({
                       if (el) el.indeterminate = !allGroupSelected && someGroupSelected;
                     }}
                     onChange={() => toggleGroup(group)}
-                    className="rounded"
+                    className="rounded flex-shrink-0"
                     onClick={(e) => e.stopPropagation()}
                   />
                   <button
                     onClick={() => toggleCollapse(groupKeyStr)}
-                    className="flex items-center gap-2 text-left"
+                    className="flex items-center gap-2 text-left min-w-0"
                   >
-                    <span className="text-gray-400 text-xs">{isCollapsed ? "▶" : "▼"}</span>
-                    <span className="text-sm font-medium text-gray-700">
+                    <span className="text-gray-400 text-xs flex-shrink-0">{isCollapsed ? "▶" : "▼"}</span>
+                    <span className="text-sm font-medium text-gray-700 truncate">
                       {group.key.suffix.split("/").pop() || "—"}
                     </span>
-                    <span className="text-xs text-gray-400">·</span>
-                    <span className="text-xs text-gray-500">{formatDate(group.blobs[0].last_modified)}</span>
+                    <span className="text-xs text-gray-400 flex-shrink-0">·</span>
+                    <span className="text-xs text-gray-500 flex-shrink-0">{formatDate(group.blobs[0].last_modified)}</span>
                   </button>
+
+                  {/* Resource badge or assign button */}
+                  {linkedResource ? (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-teal-100 text-teal-700 flex-shrink-0">
+                      {linkedResource.business_name}
+                    </span>
+                  ) : (
+                    !isAssigning && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); openAssignForm(groupKeyStr, group.key.suffix); }}
+                        className="text-xs text-gray-400 hover:text-teal-600 border border-dashed border-gray-300 hover:border-teal-400 rounded-full px-2 py-0.5 transition-colors flex-shrink-0"
+                      >
+                        + assign resource
+                      </button>
+                    )
+                  )}
                 </div>
-                <div className="flex items-center gap-2">
+
+                <div className="flex items-center gap-2 flex-shrink-0">
                   <span className="text-xs text-gray-400">
                     {group.blobs.length} file{group.blobs.length !== 1 ? "s" : ""}
                   </span>
@@ -267,6 +353,74 @@ export default function FileBrowser({
                   )}
                 </div>
               </div>
+
+              {/* Inline assign form */}
+              {isAssigning && (
+                <div className="bg-teal-50 border-b border-teal-100 px-4 py-3 flex flex-col gap-2">
+                  <p className="text-xs font-medium text-teal-800">Assign a resource to this group</p>
+
+                  {/* Select existing */}
+                  {resources.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={assignExisting}
+                        onChange={(e) => setAssignExisting(e.target.value)}
+                        className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-teal-400 flex-1"
+                      >
+                        <option value="">— select existing resource —</option>
+                        {resources.map((r) => (
+                          <option key={r.id} value={r.id}>{r.business_name}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={linkExisting}
+                        disabled={!assignExisting || assignSaving}
+                        className="px-3 py-1.5 text-sm bg-teal-600 hover:bg-teal-700 disabled:bg-teal-300 text-white rounded-lg transition-colors"
+                      >
+                        Link
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-1 text-xs text-teal-600">
+                    <span className="flex-1 border-t border-teal-200" />
+                    <span>or create new</span>
+                    <span className="flex-1 border-t border-teal-200" />
+                  </div>
+
+                  {/* Create new */}
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="Business name"
+                      value={assignBusiness}
+                      onChange={(e) => setAssignBusiness(e.target.value)}
+                      className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-teal-400 flex-1"
+                      autoFocus
+                    />
+                    <input
+                      type="text"
+                      placeholder="Technical name (prefix)"
+                      value={assignTechnical}
+                      onChange={(e) => setAssignTechnical(e.target.value)}
+                      className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-teal-400 flex-1"
+                    />
+                    <button
+                      onClick={saveAssign}
+                      disabled={!assignBusiness.trim() || !assignTechnical.trim() || assignSaving}
+                      className="px-3 py-1.5 text-sm bg-teal-600 hover:bg-teal-700 disabled:bg-teal-300 text-white rounded-lg transition-colors"
+                    >
+                      {assignSaving ? "Saving…" : "Save"}
+                    </button>
+                    <button
+                      onClick={cancelAssign}
+                      className="px-3 py-1.5 text-sm text-gray-500 hover:text-gray-700 border border-gray-200 rounded-lg transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {/* Group rows */}
               {!isCollapsed && (
@@ -279,9 +433,7 @@ export default function FileBrowser({
                         <tr
                           key={blob.name}
                           onClick={() => toggleOne(blob.name)}
-                          className={`border-t border-gray-100 cursor-pointer hover:bg-blue-50 transition-colors ${
-                            isSelected ? "bg-blue-50" : ""
-                          }`}
+                          className={`border-t border-gray-100 cursor-pointer hover:bg-blue-50 transition-colors ${isSelected ? "bg-blue-50" : ""}`}
                         >
                           <td className="px-4 py-2.5 w-8">
                             <input
@@ -296,11 +448,7 @@ export default function FileBrowser({
                             {blob.name}
                           </td>
                           <td className="px-3 py-2.5 whitespace-nowrap">
-                            <span
-                              className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${
-                                STAGE_COLORS[stage] ?? STAGE_COLORS.unknown
-                              }`}
-                            >
+                            <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${STAGE_COLORS[stage] ?? STAGE_COLORS.unknown}`}>
                               {stage}
                             </span>
                           </td>
@@ -308,9 +456,7 @@ export default function FileBrowser({
                             {formatBytes(blob.size)}
                           </td>
                           <td className="px-3 py-2.5 text-gray-500 text-xs whitespace-nowrap">
-                            {blob.last_modified
-                              ? new Date(blob.last_modified).toLocaleString()
-                              : "—"}
+                            {blob.last_modified ? new Date(blob.last_modified).toLocaleString() : "—"}
                           </td>
                         </tr>
                       );
@@ -323,11 +469,11 @@ export default function FileBrowser({
         })}
       </div>
 
-      {/* Footer summary */}
+      {/* Footer */}
       {groups.length > 0 && (
         <div className="mt-3 flex items-center justify-between text-xs text-gray-400">
           <span>
-            {groups.length} group{groups.length !== 1 ? "s" : ""} · {filtered.length} file{filtered.length !== 1 ? "s" : ""}
+            {groups.length} group{groups.length !== 1 ? "s" : ""} · {visibleBlobs.length} file{visibleBlobs.length !== 1 ? "s" : ""}
           </span>
           <button onClick={toggleAll} className="hover:text-gray-600 transition-colors">
             {allFilteredSelected ? "Deselect all" : "Select all"}

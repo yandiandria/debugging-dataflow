@@ -1,13 +1,21 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import ConnectionForm from "../components/ConnectionForm";
 import FileBrowser from "../components/FileBrowser";
 import AnalysisConfig from "../components/AnalysisConfig";
 import FlowResults from "../components/FlowResults";
 import LogPanel from "../components/LogPanel";
-import { listBlobs, analyzeStream } from "../lib/api";
-import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry } from "../lib/api";
+import ResourceManager from "../components/ResourceManager";
+import {
+  listBlobs,
+  analyzeStream,
+  getResources,
+  createResource,
+  updateResource,
+  deleteResource,
+} from "../lib/api";
+import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
-type Step = "connect" | "browse" | "config" | "analyzing" | "results";
+type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources";
 
 export default function Home() {
   const [step, setStep] = useState<Step>("connect");
@@ -16,16 +24,24 @@ export default function Home() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<AnalyzeResultFull | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [resources, setResources] = useState<Resource[]>([]);
+
+  // Load resources once on mount
+  useEffect(() => {
+    getResources().then(setResources).catch(() => {});
+  }, []);
+
+  const refreshResources = () => getResources().then(setResources).catch(() => {});
+
   // ── Step 1: connect ────────────────────────────────────────────────────────
-  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string) => {
+  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string, prefix?: string) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await listBlobs(url, dateFrom, dateTo);
+      const data = await listBlobs(url, dateFrom, dateTo, prefix);
       setContainerUrl(url);
       setBlobs(data);
       setSelected(new Set());
@@ -64,15 +80,15 @@ export default function Home() {
         filter_logic: config.filterLogic,
       },
       (entry) => setLogs((prev) => [...prev, entry]),
-      (data) => {
-        setResult(data);
-        setStep("results");
-      },
-      (message) => {
-        setError(message);
-        setStep("config");
-      }
+      (data) => { setResult(data); setStep("results"); },
+      (message) => { setError(message); setStep("config"); }
     );
+  };
+
+  // ── Resource handlers ──────────────────────────────────────────────────────
+  const handleAssignResource = async (technicalName: string, businessName: string) => {
+    await createResource(technicalName, businessName);
+    await refreshResources();
   };
 
   // ── Resets ─────────────────────────────────────────────────────────────────
@@ -86,7 +102,6 @@ export default function Home() {
     setStep("connect");
   };
 
-  // Keep the connection, just go back to file selection
   const handleNewAnalysis = () => {
     setSelected(new Set());
     setResult(null);
@@ -97,8 +112,18 @@ export default function Home() {
 
   // ── Render ─────────────────────────────────────────────────────────────────
   if (step === "connect") {
+    return <ConnectionForm onConnect={handleConnect} loading={loading} error={error} />;
+  }
+
+  if (step === "resources") {
     return (
-      <ConnectionForm onConnect={handleConnect} loading={loading} error={error} />
+      <ResourceManager
+        resources={resources}
+        onCreate={async (tn, bn) => { await createResource(tn, bn); await refreshResources(); }}
+        onUpdate={async (id, tn, bn) => { await updateResource(id, tn, bn); await refreshResources(); }}
+        onDelete={async (id) => { await deleteResource(id); await refreshResources(); }}
+        onBack={() => setStep("browse")}
+      />
     );
   }
 
@@ -119,6 +144,9 @@ export default function Home() {
             onSelectionChange={setSelected}
             onAnalyze={handleAnalyzeClick}
             onDisconnect={handleDisconnect}
+            resources={resources}
+            onAssignResource={handleAssignResource}
+            onManageResources={() => setStep("resources")}
           />
         </div>
       </div>
