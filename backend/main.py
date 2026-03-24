@@ -955,27 +955,32 @@ async def profile_blobs_stream(request: ProfileRequest) -> StreamingResponse:
     )
 
 
-def _apply_single_filter(df: pd.DataFrame, f: FilterCondition) -> pd.DataFrame:
-    """Apply one filter condition to a DataFrame and return the filtered result."""
+def _apply_single_filter(df: pl.DataFrame, f: FilterCondition) -> pl.DataFrame:
+    """Apply one filter condition to a Polars DataFrame and return the filtered result."""
     if f.column not in df.columns:
         return df  # caller handles the warning
 
-    col = df[f.column]
-
     if f.filter_type == "regex":
         try:
-            mask = col.astype(str).str.contains(f.value, regex=True, na=False)
-            return df[mask]
+            re.compile(f.value)
+            return df.filter(pl.col(f.column).cast(pl.Utf8).str.contains(f.value))
         except re.error:
-            # Invalid regex — return unchanged so caller can warn
             raise ValueError(f"Invalid regex: {f.value!r}")
     else:
-        # equals — try numeric cast, fall back to string comparison
-        try:
-            cast_value = col.dtype.type(f.value)
-            return df[col == cast_value]
-        except (ValueError, TypeError):
-            return df[col.astype(str) == f.value]
+        # equals — try numeric match for numeric columns, fall back to string
+        dtype = df[f.column].dtype
+        if dtype in (pl.Float32, pl.Float64):
+            try:
+                return df.filter(pl.col(f.column) == float(f.value))
+            except (ValueError, TypeError):
+                pass
+        elif dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                       pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+            try:
+                return df.filter(pl.col(f.column) == int(f.value))
+            except (ValueError, TypeError):
+                pass
+        return df.filter(pl.col(f.column).cast(pl.Utf8) == f.value)
 
 
 def _download_blob_to_disk(blob_client, local_path: str) -> int:
@@ -995,13 +1000,13 @@ def _process_stage_sync(
 ) -> tuple:
     """Read CSVs, merge, filter, dedup. Returns (merged_df, dedup_info, log_lines). Runs sync — use to_thread."""
     logs: List[tuple] = []
-    dfs = [pd.read_csv(p, low_memory=False) for p in local_paths]
-    merged = pd.concat(dfs, ignore_index=True)
+    dfs = [pl.read_csv(p, infer_schema_length=10000) for p in local_paths]
+    merged = pl.concat(dfs, how="diagonal")
     logs.append(("success", f"{len(merged)} rows after merge."))
 
     if active_filters:
         if filter_logic == "OR":
-            parts: List[pd.DataFrame] = []
+            parts: List[pl.DataFrame] = []
             for f in active_filters:
                 if f.column not in merged.columns:
                     logs.append(("warning", f"Filter column '{f.column}' not found — skipped."))
@@ -1014,7 +1019,7 @@ def _process_stage_sync(
                 except ValueError as exc:
                     logs.append(("warning", f"{exc} — skipped."))
             if parts:
-                merged = pd.concat(parts).drop_duplicates()
+                merged = pl.concat(parts).unique(maintain_order=True)
             logs.append(("success", f"OR filter → {len(merged)} rows remain."))
         else:  # AND
             for f in active_filters:
@@ -1035,7 +1040,7 @@ def _process_stage_sync(
         valid_keys = [k for k in key_columns if k in merged.columns]
         if valid_keys:
             before = len(merged)
-            merged = merged.drop_duplicates(subset=valid_keys, keep="first")
+            merged = merged.unique(subset=valid_keys, keep="first", maintain_order=True)
             after = len(merged)
             if before > after:
                 removed = before - after
@@ -1048,7 +1053,7 @@ def _process_stage_sync(
 
 
 def _build_flow_report(
-    stage_dfs: Dict[str, Any],
+    stage_dfs: Dict[str, pl.DataFrame],
     key_columns: List[str],
     ordered_stages: List[str],
     dedup_warnings: Dict[str, Dict[str, int]],
@@ -1064,11 +1069,11 @@ def _build_flow_report(
         if not valid_keys:
             stage_lookup[stage] = {}
             continue
-        records = json.loads(df.to_json(orient="records"))
-        str_cols = df[valid_keys].astype(str)
+        records = df.to_dicts()
+        str_key_rows = df.select([pl.col(k).cast(pl.Utf8) for k in valid_keys]).to_dicts()
         lookup: Dict[tuple, dict] = {}
-        for i, key_row in enumerate(str_cols.itertuples(index=False, name=None)):
-            key_tuple = tuple(zip(valid_keys, key_row))
+        for i, key_row in enumerate(str_key_rows):
+            key_tuple = tuple((k, key_row[k]) for k in valid_keys)
             if key_tuple not in lookup:
                 lookup[key_tuple] = records[i]
             all_key_tuples.add(key_tuple)
