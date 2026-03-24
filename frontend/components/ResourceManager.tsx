@@ -80,6 +80,37 @@ function validateBatch(filteredBlobs: BlobInfo[]): ValidationResult {
   return { valid: issues.length === 0, issues };
 }
 
+/** Shows blobs that match any of the given prefix lines, filtered to extract stage */
+function PrefixPreview({ prefixText, blobs }: { prefixText: string; blobs: BlobInfo[] }) {
+  const prefixes = prefixText.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (prefixes.length === 0) return null;
+
+  const matches = blobs.filter(
+    (b) =>
+      prefixes.some((p) => b.name.startsWith(p)) &&
+      b.detected_stage === "extract"
+  );
+
+  return (
+    <div className="mt-1 border border-dashed border-gray-300 rounded-lg px-2 py-1.5 bg-white">
+      <p className="text-xs font-medium text-gray-500 mb-1">
+        Matching extract-stage blobs ({matches.length})
+      </p>
+      {matches.length === 0 ? (
+        <p className="text-xs text-gray-400 italic">No extract-stage blobs found for these prefixes</p>
+      ) : (
+        <ul className="max-h-32 overflow-y-auto space-y-0.5">
+          {matches.map((b) => (
+            <li key={b.name} className="text-xs font-mono text-gray-600 truncate" title={b.name}>
+              {b.name}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export default function ResourceManager({ resources, blobs, filteredBlobsByResource, autoDateByResource, dateOverrides, onDateOverridesChange, onCreate, onUpdate, onDelete, onBack, onRefreshBlobs }: Props) {
   const [editState, setEditState] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
@@ -92,10 +123,16 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
   const [newExtractPrefixesText, setNewExtractPrefixesText] = useState("");
 
   // Matching blobs per resource (unfiltered — used for date dropdown options)
+  // Includes blobs matched by extract_prefixes (not just the main technical_name prefix)
   const matchingBlobsByResource = useMemo(() => {
     const result: Record<string, BlobInfo[]> = {};
     for (const r of resources) {
-      result[r.id] = blobs.filter((b) => b.name.startsWith(r.technical_name));
+      const eps = r.extract_prefixes ?? [];
+      result[r.id] = blobs.filter(
+        (b) =>
+          b.name.startsWith(r.technical_name) ||
+          eps.some((p) => p.trim() && b.name.startsWith(p.trim()))
+      );
     }
     return result;
   }, [resources, blobs]);
@@ -290,6 +327,7 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
                   className="w-full border border-teal-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-teal-400 resize-none"
                 />
                 <p className="text-xs text-teal-500 mt-0.5">Additional Azure prefixes for this resource — only extract-stage files are kept.</p>
+                <PrefixPreview prefixText={newExtractPrefixesText} blobs={blobs} />
               </div>
             </div>
           )}
@@ -384,6 +422,7 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
                       className="w-full border border-blue-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"
                     />
                     <p className="text-xs text-blue-400 mt-0.5">Additional Azure prefixes for this resource — only extract-stage files are kept.</p>
+                    <PrefixPreview prefixText={editState.extract_prefixes_text} blobs={blobs} />
                   </div>
                 )}
 
