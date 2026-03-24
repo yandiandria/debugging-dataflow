@@ -454,6 +454,18 @@ export async function updateDagConfig(config: DAGConfig): Promise<DAGConfig> {
   return res.json();
 }
 
+export async function listAirflowDags(): Promise<string[]> {
+  const res = await fetch(`${BASE_URL}/api/dags/list-airflow`, { method: "POST" });
+  if (!res.ok) throw new Error("Failed to list Airflow DAGs");
+  const data = await res.json();
+  if (Array.isArray(data)) {
+    return (data as { dag_id?: string }[])
+      .map((d) => d.dag_id ?? "")
+      .filter(Boolean);
+  }
+  return [];
+}
+
 export async function triggerDagStream(
   dag_id: string,
   padoa_env: string,

@@ -117,6 +117,10 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [search, setSearch] = useState("");
+  const [regexMode, setRegexMode] = useState(false);
+  const [regexError, setRegexError] = useState(false);
+
   const [showNew, setShowNew] = useState(false);
   const [newTechnical, setNewTechnical] = useState("");
   const [newBusiness, setNewBusiness] = useState("");
@@ -170,6 +174,25 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
     }
     return result;
   }, [resources, filteredBlobsByResource]);
+
+  const filteredResources = useMemo(() => {
+    if (!search) { setRegexError(false); return resources; }
+    if (regexMode) {
+      try {
+        const re = new RegExp(search, "i");
+        setRegexError(false);
+        return resources.filter((r) => re.test(r.business_name) || re.test(r.technical_name));
+      } catch {
+        setRegexError(true);
+        return [];
+      }
+    }
+    setRegexError(false);
+    const q = search.toLowerCase();
+    return resources.filter(
+      (r) => r.business_name.toLowerCase().includes(q) || r.technical_name.toLowerCase().includes(q)
+    );
+  }, [resources, search, regexMode]);
 
   const startEdit = (r: Resource) => {
     setEditState({
@@ -244,7 +267,7 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
           <span className="text-gray-200">|</span>
           <h2 className="text-sm font-semibold text-gray-800">Resources</h2>
           <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">
-            {resources.length} resource{resources.length !== 1 ? "s" : ""}
+            {search ? `${filteredResources.length} / ` : ""}{resources.length} resource{resources.length !== 1 ? "s" : ""}
           </span>
         </div>
         <div className="flex gap-2">
@@ -271,6 +294,33 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
             {error}
           </div>
         )}
+
+        {/* Search bar */}
+        <div className="mb-3 relative flex items-center">
+          <input
+            type="text"
+            placeholder={regexMode ? "Regex pattern…" : "Search resources…"}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className={`border rounded-lg pl-3 pr-10 py-2 text-sm focus:outline-none focus:ring-2 w-full ${
+              regexError
+                ? "border-red-400 focus:ring-red-400"
+                : "border-gray-300 focus:ring-blue-500"
+            } ${regexMode ? "font-mono" : ""}`}
+          />
+          <button
+            type="button"
+            onClick={() => { setRegexMode((v) => !v); setRegexError(false); }}
+            title={regexMode ? "Switch to text search" : "Switch to regex search"}
+            className={`absolute right-2 text-xs px-1 py-0.5 rounded font-mono font-bold transition-colors ${
+              regexMode
+                ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+            }`}
+          >
+            .*
+          </button>
+        </div>
 
         <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
           {/* Table header */}
@@ -339,7 +389,13 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
             </div>
           )}
 
-          {resources.map((r) => {
+          {resources.length > 0 && filteredResources.length === 0 && !showNew && (
+            <div className="px-4 py-10 text-center text-sm text-gray-400">
+              No resources match your search.
+            </div>
+          )}
+
+          {filteredResources.map((r) => {
             const isEditing = editState?.id === r.id;
             const isDeleting = deletingId === r.id;
             const dates = datesByResource[r.id] ?? [];

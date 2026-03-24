@@ -107,6 +107,8 @@ export default function FileBrowser({
   onManageResources,
 }: Props) {
   const [search, setSearch] = useState("");
+  const [regexMode, setRegexMode] = useState(false);
+  const [regexError, setRegexError] = useState(false);
   const [stageFilter, setStageFilter] = useState<string>("all");
   const [resourceFilter, setResourceFilter] = useState<string>("all");
   const [dateFilter, setDateFilter] = useState<string>("all");
@@ -137,13 +139,27 @@ export default function FileBrowser({
   }, [resources]);
 
   const filtered = useMemo(() => {
+    let re: RegExp | null = null;
+    if (regexMode && search) {
+      try {
+        re = new RegExp(search, "i");
+        setRegexError(false);
+      } catch {
+        setRegexError(true);
+        return [];
+      }
+    } else {
+      setRegexError(false);
+    }
     return blobs.filter((b) => {
-      const matchesSearch = b.name.toLowerCase().includes(search.toLowerCase());
+      const matchesSearch = search
+        ? re ? re.test(b.name) : b.name.toLowerCase().includes(search.toLowerCase())
+        : true;
       const matchesStage =
         stageFilter === "all" || (b.detected_stage ?? "unknown") === stageFilter;
       return matchesSearch && matchesStage;
     });
-  }, [blobs, search, stageFilter]);
+  }, [blobs, search, regexMode, stageFilter]);
 
   const groupPrefixMap = useMemo(() => {
     const map = buildGroupPrefixMap(blobs, resources);
@@ -343,13 +359,31 @@ export default function FileBrowser({
       {/* Toolbar */}
       <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
         <div className="flex items-center gap-2 flex-1 min-w-0 flex-wrap">
-          <input
-            type="text"
-            placeholder="Search files…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 flex-1 min-w-32"
-          />
+          <div className="relative flex items-center flex-1 min-w-32">
+            <input
+              type="text"
+              placeholder={regexMode ? "Regex pattern…" : "Search files…"}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className={`border rounded-lg pl-3 pr-10 py-2 text-sm focus:outline-none focus:ring-2 w-full ${
+                regexError
+                  ? "border-red-400 focus:ring-red-400"
+                  : "border-gray-300 focus:ring-blue-500"
+              } ${regexMode ? "font-mono" : ""}`}
+            />
+            <button
+              type="button"
+              onClick={() => { setRegexMode((v) => !v); setRegexError(false); }}
+              title={regexMode ? "Switch to text search" : "Switch to regex search"}
+              className={`absolute right-2 text-xs px-1 py-0.5 rounded font-mono font-bold transition-colors ${
+                regexMode
+                  ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                  : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+              }`}
+            >
+              .*
+            </button>
+          </div>
           <select
             value={stageFilter}
             onChange={(e) => setStageFilter(e.target.value)}

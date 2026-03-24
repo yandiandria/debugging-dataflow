@@ -1,6 +1,54 @@
 import { useState, useEffect } from "react";
 import type { DAG, DAGConfig } from "../lib/api";
-import { getDags, createDag, updateDag, deleteDag, getDagConfig, updateDagConfig } from "../lib/api";
+import { getDags, createDag, updateDag, deleteDag, getDagConfig, updateDagConfig, listAirflowDags } from "../lib/api";
+
+function DagIdInput({
+  value,
+  onChange,
+  suggestions,
+  className,
+  placeholder = "airflow_dag_id",
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  suggestions: string[];
+  className?: string;
+  placeholder?: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  const filtered = suggestions.filter(
+    (id) => id.toLowerCase().includes(value.toLowerCase()) && id !== value
+  );
+
+  return (
+    <div className="relative">
+      <input
+        type="text"
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        className={className}
+      />
+      {open && filtered.length > 0 && (
+        <ul className="absolute z-20 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+          {filtered.map((id) => (
+            <li
+              key={id}
+              onMouseDown={() => { onChange(id); setOpen(false); }}
+              className="px-3 py-1.5 text-sm font-mono cursor-pointer hover:bg-indigo-50 hover:text-indigo-700 truncate"
+              title={id}
+            >
+              {id}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 interface Props {
   onBack: () => void;
@@ -25,10 +73,12 @@ export default function DAGManager({ onBack }: Props) {
   const [editingConfig, setEditingConfig] = useState(false);
   const [configDraft, setConfigDraft] = useState("");
   const [configEnvsDraft, setConfigEnvsDraft] = useState("");
+  const [airflowDags, setAirflowDags] = useState<string[]>([]);
 
   useEffect(() => {
     getDags().then(setDags).catch(() => {});
     getDagConfig().then((c) => setConfig(c)).catch(() => {});
+    listAirflowDags().then(setAirflowDags).catch(() => {});
   }, []);
 
   const refresh = async () => {
@@ -41,11 +91,12 @@ export default function DAGManager({ onBack }: Props) {
     setSaving(true);
     setError(null);
     try {
-      await createDag(newDagId.trim(), newDisplayName.trim());
-      await refresh();
+      const created = await createDag(newDagId.trim(), newDisplayName.trim());
+      setDags((prev) => [...prev, created]);
       setNewDagId("");
       setNewDisplayName("");
       setShowNew(false);
+      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Create failed");
     } finally {
@@ -58,9 +109,10 @@ export default function DAGManager({ onBack }: Props) {
     setSaving(true);
     setError(null);
     try {
-      await updateDag(editState.id, editState.dag_id.trim(), editState.display_name.trim());
-      await refresh();
+      const updated = await updateDag(editState.id, editState.dag_id.trim(), editState.display_name.trim());
+      setDags((prev) => prev.map((d) => (d.id === updated.id ? updated : d)));
       setEditState(null);
+      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Save failed");
     } finally {
@@ -73,7 +125,8 @@ export default function DAGManager({ onBack }: Props) {
     setError(null);
     try {
       await deleteDag(id);
-      await refresh();
+      setDags((prev) => prev.filter((d) => d.id !== id));
+      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Delete failed");
     } finally {
@@ -196,12 +249,11 @@ export default function DAGManager({ onBack }: Props) {
                 autoFocus
                 className="border border-indigo-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
               />
-              <input
-                type="text"
-                placeholder="airflow_dag_id"
+              <DagIdInput
                 value={newDagId}
-                onChange={(e) => setNewDagId(e.target.value)}
-                className="border border-indigo-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                onChange={setNewDagId}
+                suggestions={airflowDags}
+                className="border border-indigo-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400 w-full"
               />
               <div className="flex gap-2">
                 <button
@@ -242,11 +294,11 @@ export default function DAGManager({ onBack }: Props) {
                       autoFocus
                       className="border border-blue-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
                     />
-                    <input
-                      type="text"
+                    <DagIdInput
                       value={editState.dag_id}
-                      onChange={(e) => setEditState({ ...editState, dag_id: e.target.value })}
-                      className="border border-blue-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+                      onChange={(v) => setEditState({ ...editState, dag_id: v })}
+                      suggestions={airflowDags}
+                      className="border border-blue-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400 w-full"
                     />
                     <div className="flex gap-2">
                       <button onClick={saveEdit} disabled={saving} className="text-sm px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded-lg">
