@@ -694,6 +694,99 @@ export async function getColumnValues(
   return res.json();
 }
 
+// ── Notion integration ────────────────────────────────────────────────────────
+
+export interface NotionPropertySchema {
+  type: string;
+  options?: string[];
+}
+
+export interface NotionSchema {
+  properties: Record<string, NotionPropertySchema>;
+  property_order: string[];
+}
+
+export interface NotionRow {
+  id: string;
+  url: string;
+  created_time: string;
+  last_edited_time: string;
+  properties: Record<string, unknown>;
+}
+
+export interface NotionConfig {
+  token: string;
+  database_id: string;
+}
+
+export async function getNotionConfig(): Promise<NotionConfig> {
+  const res = await fetch(`${BASE_URL}/api/notion/config`);
+  if (!res.ok) throw new Error("Failed to load Notion config");
+  return res.json();
+}
+
+export async function saveNotionConfig(config: NotionConfig): Promise<NotionConfig> {
+  const res = await fetch(`${BASE_URL}/api/notion/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) throw new Error("Failed to save Notion config");
+  return res.json();
+}
+
+export async function getNotionSchema(): Promise<NotionSchema> {
+  const res = await fetch(`${BASE_URL}/api/notion/schema`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to load Notion schema");
+  }
+  return res.json();
+}
+
+export async function getNotionRows(): Promise<NotionRow[]> {
+  const res = await fetch(`${BASE_URL}/api/notion/rows`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to load Notion rows");
+  }
+  return res.json();
+}
+
+export async function createNotionRow(properties: Record<string, unknown>): Promise<NotionRow> {
+  const res = await fetch(`${BASE_URL}/api/notion/rows`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ properties }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to create row");
+  }
+  return res.json();
+}
+
+export async function updateNotionRow(pageId: string, properties: Record<string, unknown>): Promise<NotionRow> {
+  const res = await fetch(`${BASE_URL}/api/notion/rows/${pageId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ properties }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to update row");
+  }
+  return res.json();
+}
+
+export async function deleteNotionRow(pageId: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/notion/rows/${pageId}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to delete row");
+  }
+}
+
 // ── Analysis history ──────────────────────────────────────────────────────────
 
 export async function listHistory(): Promise<HistorySummary[]> {

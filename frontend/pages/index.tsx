@@ -10,6 +10,7 @@ import VolumetryPanel from "../components/VolumetryPanel";
 import DAGManager from "../components/DAGManager";
 import IntegrationRuleManager from "../components/IntegrationRuleManager";
 import ResourceDashboard from "../components/ResourceDashboard";
+import NotionDatabase from "../components/NotionDatabase";
 import type { VolumetryEntry } from "../components/VolumetryPanel";
 import {
   listBlobs,
@@ -22,7 +23,7 @@ import {
 } from "../lib/api";
 import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
-type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard" | "history";
+type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard" | "history" | "notion";
 
 const GAP_MINUTES = 15;
 
@@ -333,6 +334,8 @@ export default function Home() {
     content = <DAGManager onBack={() => setStep("browse")} />;
   } else if (step === "rules") {
     content = <IntegrationRuleManager resources={resources} onBack={() => setStep("browse")} />;
+  } else if (step === "notion") {
+    content = <NotionDatabase onBack={() => setStep("browse")} />;
   } else if (step === "dashboard") {
     content = (
       <ResourceDashboard
@@ -385,6 +388,12 @@ export default function Home() {
                 className="text-sm bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg transition-colors"
               >
                 Rules
+              </button>
+              <button
+                onClick={() => setStep("notion")}
+                className="text-sm bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                Injection Tracker
               </button>
             </div>
           </div>
