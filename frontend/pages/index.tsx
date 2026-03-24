@@ -356,6 +356,13 @@ export default function Home() {
             </div>
             <div className="flex items-center gap-2">
               <button
+                onClick={handleRefreshBlobs}
+                disabled={loading || !connectionParams}
+                className="text-sm bg-gray-600 hover:bg-gray-700 disabled:bg-gray-400 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                {loading ? "Refreshing…" : "Refresh blobs"}
+              </button>
+              <button
                 onClick={() => setStep("history")}
                 className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
               >
