@@ -564,8 +564,12 @@ async def list_airflow_dags():
         raise HTTPException(status_code=400, detail="Docker container name not configured.")
 
     cmd = ["docker", "exec", container, "airflow", "dags", "list", "-o", "json"]
+    loop = asyncio.get_event_loop()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=30),
+        )
         if result.returncode != 0:
             raise HTTPException(status_code=500, detail=result.stderr or "Failed to list DAGs")
         try:
