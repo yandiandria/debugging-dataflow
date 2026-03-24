@@ -843,13 +843,18 @@ async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
 
 @app.post("/api/blobs/columns")
 async def get_blob_columns(request: ColumnsRequest) -> List[str]:
-    """Return column names of a single CSV blob (reads only the first row)."""
+    """Return column names of a CSV blob. Reads from local cache when available,
+    otherwise fetches only the first 8 KB from Azure (enough for any header row)."""
     try:
+        cache_path = _blob_cache_path(request.container_url, request.blob_name)
+        if cache_path.exists():
+            return pl.read_csv(cache_path, n_rows=0).columns
         client = build_container_client(request.container_url)
         blob_client = client.get_blob_client(request.blob_name)
-        raw = blob_client.download_blob().readall()
-        df = pd.read_csv(io.BytesIO(raw), nrows=0)
-        return list(df.columns)
+        raw = await asyncio.to_thread(
+            lambda: blob_client.download_blob(offset=0, length=8_192).readall()
+        )
+        return pl.read_csv(io.BytesIO(raw), n_rows=0, truncate_ragged_lines=True).columns
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
     except Exception as e:
@@ -858,15 +863,24 @@ async def get_blob_columns(request: ColumnsRequest) -> List[str]:
 
 @app.post("/api/blobs/preview")
 async def preview_blob(request: PreviewRequest):
-    """Return the first N rows of a CSV blob as JSON."""
+    """Return the first N rows of a CSV blob. Reads from local cache when available,
+    otherwise fetches only the first 512 KB from Azure."""
     try:
-        client = build_container_client(request.container_url)
-        blob_client = client.get_blob_client(request.blob_name)
-        raw = blob_client.download_blob().readall()
-        df = pd.read_csv(io.BytesIO(raw), nrows=request.limit)
+        cache_path = _blob_cache_path(request.container_url, request.blob_name)
+        if cache_path.exists():
+            df = pl.read_csv(cache_path, n_rows=request.limit, infer_schema_length=100)
+        else:
+            client = build_container_client(request.container_url)
+            blob_client = client.get_blob_client(request.blob_name)
+            raw = await asyncio.to_thread(
+                lambda: blob_client.download_blob(offset=0, length=512 * 1024).readall()
+            )
+            # Drop the potentially truncated last line before parsing
+            raw = raw[: raw.rfind(b"\n") + 1] if b"\n" in raw else raw
+            df = pl.read_csv(io.BytesIO(raw), n_rows=request.limit, infer_schema_length=100)
         return {
-            "columns": list(df.columns),
-            "rows": json.loads(df.to_json(orient="records")),
+            "columns": df.columns,
+            "rows": df.to_dicts(),
             "total_rows_loaded": len(df),
         }
     except AzureError as e:
