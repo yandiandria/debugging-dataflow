@@ -18,6 +18,7 @@ from azure.storage.blob import ContainerClient
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from notion_client import AsyncClient as NotionAsyncClient
 from pydantic import BaseModel
 
 BLOB_CACHE_DIR = Path(".cache/dataflow/blobs")
@@ -67,7 +68,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3001", "http://127.0.0.1:3001"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -82,6 +83,7 @@ RULES_FILE = DATA_DIR / "rules.json"
 DAG_RUNS_FILE = DATA_DIR / "dag_runs.json"
 MAPPING_ISSUES_FILE = DATA_DIR / "mapping_issues.json"
 QA_EXAMPLES_FILE = DATA_DIR / "qa_examples.json"
+NOTION_CONFIG_FILE = DATA_DIR / "notion_config.json"
 
 
 def _load_json(path: Path) -> List[Dict]:
@@ -110,6 +112,75 @@ def _load_dag_config() -> Dict:
 
 def _save_dag_config(config: Dict) -> None:
     DAG_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def _load_notion_config() -> Dict:
+    if not NOTION_CONFIG_FILE.exists():
+        return {"token": "", "database_id": ""}
+    return json.loads(NOTION_CONFIG_FILE.read_text())
+
+
+def _save_notion_config(config: Dict) -> None:
+    NOTION_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+# Notion property types that can be written via the API
+_NOTION_EDITABLE = {"title", "rich_text", "number", "select", "multi_select", "date", "checkbox", "url", "email", "phone_number"}
+
+
+def _extract_prop_value(prop: Dict) -> Any:
+    ptype = prop["type"]
+    val = prop.get(ptype)
+    if ptype in ("title", "rich_text"):
+        return val[0]["plain_text"] if val else ""
+    if ptype == "number":
+        return val
+    if ptype == "select":
+        return val["name"] if val else None
+    if ptype == "multi_select":
+        return [o["name"] for o in val] if val else []
+    if ptype == "date":
+        return val["start"] if val else None
+    if ptype == "checkbox":
+        return bool(val)
+    if ptype in ("url", "email", "phone_number"):
+        return val
+    if ptype in ("created_time", "last_edited_time"):
+        return val
+    if ptype == "formula" and isinstance(val, dict):
+        ft = val.get("type")
+        return val.get(ft)
+    return None
+
+
+def _build_prop_payload(ptype: str, value: Any) -> Dict:
+    if ptype in ("title", "rich_text"):
+        return {ptype: [{"text": {"content": str(value or "")}}]}
+    if ptype == "number":
+        return {"number": float(value) if value not in (None, "") else None}
+    if ptype == "select":
+        return {"select": {"name": value} if value else None}
+    if ptype == "multi_select":
+        vals = value if isinstance(value, list) else [v.strip() for v in str(value).split(",") if v.strip()] if value else []
+        return {"multi_select": [{"name": v} for v in vals]}
+    if ptype == "date":
+        return {"date": {"start": value} if value else None}
+    if ptype == "checkbox":
+        return {"checkbox": bool(value)}
+    if ptype in ("url", "email", "phone_number"):
+        return {ptype: value or None}
+    raise ValueError(f"Cannot edit property of type: {ptype}")
+
+
+def _page_to_dict(page: Dict) -> Dict:
+    props = {name: _extract_prop_value(prop) for name, prop in page["properties"].items()}
+    return {
+        "id": page["id"],
+        "url": page.get("url", ""),
+        "created_time": page.get("created_time", ""),
+        "last_edited_time": page.get("last_edited_time", ""),
+        "properties": props,
+    }
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -211,6 +282,19 @@ class DAGLogRequest(BaseModel):
     dag_id: str
     run_id: str
     task_ids: List[str] = []
+
+
+class NotionConfigUpdate(BaseModel):
+    token: str
+    database_id: str
+
+
+class NotionPageCreate(BaseModel):
+    properties: Dict[str, Any]
+
+
+class NotionPageUpdate(BaseModel):
+    properties: Dict[str, Any]
 
 
 # ── Integration Rule models ───────────────────────────────────────────────────
@@ -1328,3 +1412,100 @@ async def delete_history_entry(entry_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="History entry not found")
     path.unlink()
+
+
+# ── Notion integration ────────────────────────────────────────────────────────
+
+def _notion_client() -> NotionAsyncClient:
+    config = _load_notion_config()
+    if not config.get("token") or not config.get("database_id"):
+        raise HTTPException(status_code=400, detail="Notion not configured — set token and database_id first")
+    return NotionAsyncClient(auth=config["token"])
+
+
+@app.get("/api/notion/config")
+async def get_notion_config():
+    return _load_notion_config()
+
+
+@app.put("/api/notion/config")
+async def update_notion_config(body: NotionConfigUpdate):
+    config = {"token": body.token, "database_id": body.database_id}
+    _save_notion_config(config)
+    return config
+
+
+@app.get("/api/notion/schema")
+async def get_notion_schema():
+    notion = _notion_client()
+    db_id = _load_notion_config()["database_id"]
+    db = await notion.databases.retrieve(database_id=db_id)
+    props: Dict[str, Any] = {}
+    order: List[str] = []
+    for name, prop in db["properties"].items():
+        ptype = prop["type"]
+        info: Dict[str, Any] = {"type": ptype}
+        if ptype == "select":
+            info["options"] = [o["name"] for o in prop["select"]["options"]]
+        elif ptype == "multi_select":
+            info["options"] = [o["name"] for o in prop["multi_select"]["options"]]
+        props[name] = info
+        order.append(name)
+    return {"properties": props, "property_order": order}
+
+
+@app.get("/api/notion/rows")
+async def get_notion_rows():
+    notion = _notion_client()
+    db_id = _load_notion_config()["database_id"]
+    all_results: List[Dict] = []
+    cursor: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {"database_id": db_id}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        resp = await notion.databases.query(**kwargs)
+        all_results.extend(resp["results"])
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+    return [_page_to_dict(p) for p in all_results]
+
+
+@app.post("/api/notion/rows", status_code=201)
+async def create_notion_row(body: NotionPageCreate):
+    notion = _notion_client()
+    db_id = _load_notion_config()["database_id"]
+    db = await notion.databases.retrieve(database_id=db_id)
+    schema = {name: prop["type"] for name, prop in db["properties"].items()}
+    notion_props = {
+        name: _build_prop_payload(schema[name], value)
+        for name, value in body.properties.items()
+        if schema.get(name) in _NOTION_EDITABLE
+    }
+    page = await notion.pages.create(
+        parent={"database_id": db_id},
+        properties=notion_props,
+    )
+    return _page_to_dict(page)
+
+
+@app.patch("/api/notion/rows/{page_id}")
+async def update_notion_row(page_id: str, body: NotionPageUpdate):
+    notion = _notion_client()
+    db_id = _load_notion_config()["database_id"]
+    db = await notion.databases.retrieve(database_id=db_id)
+    schema = {name: prop["type"] for name, prop in db["properties"].items()}
+    notion_props = {
+        name: _build_prop_payload(schema[name], value)
+        for name, value in body.properties.items()
+        if schema.get(name) in _NOTION_EDITABLE
+    }
+    page = await notion.pages.update(page_id=page_id, properties=notion_props)
+    return _page_to_dict(page)
+
+
+@app.delete("/api/notion/rows/{page_id}", status_code=204)
+async def delete_notion_row(page_id: str):
+    notion = _notion_client()
+    await notion.pages.update(page_id=page_id, archived=True)
