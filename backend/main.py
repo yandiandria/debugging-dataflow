@@ -128,9 +128,10 @@ class ResourceCreate(BaseModel):
 
 class BlobListRequest(BaseModel):
     container_url: str
-    prefix: Optional[str] = None     # Azure-side path prefix filter
-    date_from: Optional[str] = None  # ISO date string, e.g. "2024-01-15"
-    date_to: Optional[str] = None    # ISO date string, inclusive
+    prefix: Optional[str] = None           # Azure-side path prefix filter (all stages)
+    extract_prefixes: List[str] = []       # Extra prefixes — only extract-stage blobs kept
+    date_from: Optional[str] = None        # ISO date string, e.g. "2024-01-15"
+    date_to: Optional[str] = None          # ISO date string, inclusive
 
 
 class BlobInfo(BaseModel):
@@ -818,22 +819,38 @@ async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
         )
 
         client = build_container_client(request.container_url)
+        seen: set = set()
         blobs: List[BlobInfo] = []
-        for blob in client.list_blobs(name_starts_with=request.prefix or None):
-            if not blob.name.lower().endswith(".csv"):
-                continue
-            lm = blob.last_modified
-            if lm:
-                if date_from and lm < date_from:
+
+        def _collect(name_starts_with: Optional[str], extract_only: bool = False) -> None:
+            for blob in client.list_blobs(name_starts_with=name_starts_with):
+                if not blob.name.lower().endswith(".csv"):
                     continue
-                if date_to and lm > date_to:
+                lm = blob.last_modified
+                if lm:
+                    if date_from and lm < date_from:
+                        continue
+                    if date_to and lm > date_to:
+                        continue
+                if blob.name in seen:
                     continue
-            blobs.append(BlobInfo(
-                name=blob.name,
-                size=blob.size or 0,
-                last_modified=lm.isoformat() if lm else "",
-                detected_stage=detect_stage(blob.name),
-            ))
+                stage = detect_stage(blob.name)
+                if extract_only and stage != "extract":
+                    continue
+                seen.add(blob.name)
+                blobs.append(BlobInfo(
+                    name=blob.name,
+                    size=blob.size or 0,
+                    last_modified=lm.isoformat() if lm else "",
+                    detected_stage=stage,
+                ))
+
+        _collect(request.prefix or None)
+        for ep in request.extract_prefixes:
+            ep = ep.strip()
+            if ep:
+                _collect(ep, extract_only=True)
+
         return blobs
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
@@ -843,13 +860,18 @@ async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
 
 @app.post("/api/blobs/columns")
 async def get_blob_columns(request: ColumnsRequest) -> List[str]:
-    """Return column names of a single CSV blob (reads only the first row)."""
+    """Return column names of a CSV blob. Reads from local cache when available,
+    otherwise fetches only the first 8 KB from Azure (enough for any header row)."""
     try:
+        cache_path = _blob_cache_path(request.container_url, request.blob_name)
+        if cache_path.exists():
+            return pl.read_csv(cache_path, n_rows=0).columns
         client = build_container_client(request.container_url)
         blob_client = client.get_blob_client(request.blob_name)
-        raw = blob_client.download_blob().readall()
-        df = pd.read_csv(io.BytesIO(raw), nrows=0)
-        return list(df.columns)
+        raw = await asyncio.to_thread(
+            lambda: blob_client.download_blob(offset=0, length=8_192).readall()
+        )
+        return pl.read_csv(io.BytesIO(raw), n_rows=0, truncate_ragged_lines=True).columns
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
     except Exception as e:
@@ -858,15 +880,24 @@ async def get_blob_columns(request: ColumnsRequest) -> List[str]:
 
 @app.post("/api/blobs/preview")
 async def preview_blob(request: PreviewRequest):
-    """Return the first N rows of a CSV blob as JSON."""
+    """Return the first N rows of a CSV blob. Reads from local cache when available,
+    otherwise fetches only the first 512 KB from Azure."""
     try:
-        client = build_container_client(request.container_url)
-        blob_client = client.get_blob_client(request.blob_name)
-        raw = blob_client.download_blob().readall()
-        df = pd.read_csv(io.BytesIO(raw), nrows=request.limit)
+        cache_path = _blob_cache_path(request.container_url, request.blob_name)
+        if cache_path.exists():
+            df = pl.read_csv(cache_path, n_rows=request.limit, infer_schema_length=100)
+        else:
+            client = build_container_client(request.container_url)
+            blob_client = client.get_blob_client(request.blob_name)
+            raw = await asyncio.to_thread(
+                lambda: blob_client.download_blob(offset=0, length=512 * 1024).readall()
+            )
+            # Drop the potentially truncated last line before parsing
+            raw = raw[: raw.rfind(b"\n") + 1] if b"\n" in raw else raw
+            df = pl.read_csv(io.BytesIO(raw), n_rows=request.limit, infer_schema_length=100)
         return {
-            "columns": list(df.columns),
-            "rows": json.loads(df.to_json(orient="records")),
+            "columns": df.columns,
+            "rows": df.to_dicts(),
             "total_rows_loaded": len(df),
         }
     except AzureError as e:
@@ -1090,7 +1121,7 @@ def _build_flow_report(
             stage_lookup[stage] = {}
             continue
         records = df.to_dicts()
-        str_key_rows = df.select([pl.col(k).cast(pl.Utf8) for k in valid_keys]).to_dicts()
+        str_key_rows = df.select([pl.col(k).cast(pl.Utf8).fill_null("") for k in valid_keys]).to_dicts()
         lookup: Dict[tuple, dict] = {}
         for i, key_row in enumerate(str_key_rows):
             key_tuple = tuple((k, key_row[k]) for k in valid_keys)
