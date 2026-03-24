@@ -95,6 +95,7 @@ export interface Resource {
   business_name: string;
   created_at: string;
   dag_ids?: string[];
+  extract_prefixes?: string[];
 }
 
 // ── DAG types ──────────────────────────────────────────────────────────────
@@ -162,11 +163,11 @@ export async function getResources(): Promise<Resource[]> {
   return res.json();
 }
 
-export async function createResource(technical_name: string, business_name: string): Promise<Resource> {
+export async function createResource(technical_name: string, business_name: string, extract_prefixes?: string[]): Promise<Resource> {
   const res = await fetch(`${BASE_URL}/api/resources`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ technical_name, business_name }),
+    body: JSON.stringify({ technical_name, business_name, ...(extract_prefixes && { extract_prefixes }) }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -175,11 +176,11 @@ export async function createResource(technical_name: string, business_name: stri
   return res.json();
 }
 
-export async function updateResource(id: string, technical_name: string, business_name: string): Promise<Resource> {
+export async function updateResource(id: string, technical_name: string, business_name: string, extract_prefixes?: string[]): Promise<Resource> {
   const res = await fetch(`${BASE_URL}/api/resources/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ technical_name, business_name }),
+    body: JSON.stringify({ technical_name, business_name, ...(extract_prefixes && { extract_prefixes }) }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));

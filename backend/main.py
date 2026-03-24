@@ -119,11 +119,13 @@ class Resource(BaseModel):
     technical_name: str
     business_name: str
     created_at: str
+    extract_prefixes: List[str] = []
 
 
 class ResourceCreate(BaseModel):
     technical_name: str
     business_name: str
+    extract_prefixes: List[str] = []
 
 
 class BlobListRequest(BaseModel):
@@ -294,6 +296,7 @@ async def create_resource(body: ResourceCreate) -> Resource:
         technical_name=body.technical_name,
         business_name=body.business_name,
         created_at=datetime.now(timezone.utc).isoformat(),
+        extract_prefixes=body.extract_prefixes,
     )
     resources.append(resource.model_dump())
     _save_resources(resources)
@@ -307,6 +310,7 @@ async def update_resource(resource_id: str, body: ResourceCreate) -> Resource:
         if r["id"] == resource_id:
             r["technical_name"] = body.technical_name
             r["business_name"] = body.business_name
+            r["extract_prefixes"] = body.extract_prefixes
             resources[i] = r
             _save_resources(resources)
             return Resource(**r)

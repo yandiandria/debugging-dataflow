@@ -50,6 +50,14 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Store params used for the last successful connection so we can refresh blobs
+  const [connectionParams, setConnectionParams] = useState<{
+    url: string;
+    dateFrom?: string;
+    dateTo?: string;
+    prefix?: string;
+  } | null>(null);
+
   const [resources, setResources] = useState<Resource[]>([]);
   const [initialConfig, setInitialConfig] = useState<{
     keyColumns: string[];
@@ -103,17 +111,41 @@ export default function Home() {
   const refreshResources = () => getResources().then(setResources).catch(() => {});
 
   // ── Step 1: connect ────────────────────────────────────────────────────────
-  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string, prefix?: string, extractPrefixes?: string[]) => {
+  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string, prefix?: string) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await listBlobs(url, dateFrom, dateTo, prefix, extractPrefixes);
+      const allExtractPrefixes = resources.flatMap((r) => r.extract_prefixes ?? []);
+      const data = await listBlobs(url, dateFrom, dateTo, prefix, allExtractPrefixes.length > 0 ? allExtractPrefixes : undefined);
       setContainerUrl(url);
+      setConnectionParams({ url, dateFrom, dateTo, prefix });
       setBlobs(data);
       setSelected(new Set());
       // Clear volumetry when connecting to a new container
       setVolumetryData({});
       setStep("browse");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Refresh blobs (re-fetch with current resource extract prefixes) ─────────
+  const handleRefreshBlobs = async () => {
+    if (!connectionParams) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const allExtractPrefixes = resources.flatMap((r) => r.extract_prefixes ?? []);
+      const data = await listBlobs(
+        connectionParams.url,
+        connectionParams.dateFrom,
+        connectionParams.dateTo,
+        connectionParams.prefix,
+        allExtractPrefixes.length > 0 ? allExtractPrefixes : undefined,
+      );
+      setBlobs(data);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
@@ -231,6 +263,7 @@ export default function Home() {
   // ── Resets ─────────────────────────────────────────────────────────────────
   const handleDisconnect = () => {
     setContainerUrl("");
+    setConnectionParams(null);
     setBlobs([]);
     setSelected(new Set());
     setResult(null);
@@ -289,10 +322,11 @@ export default function Home() {
         autoDateByResource={autoDateByResource}
         dateOverrides={dateOverrides}
         onDateOverridesChange={setDateOverrides}
-        onCreate={async (tn, bn) => { await createResource(tn, bn); await refreshResources(); }}
-        onUpdate={async (id, tn, bn) => { await updateResource(id, tn, bn); await refreshResources(); }}
+        onCreate={async (tn, bn, ep) => { await createResource(tn, bn, ep); await refreshResources(); }}
+        onUpdate={async (id, tn, bn, ep) => { await updateResource(id, tn, bn, ep); await refreshResources(); }}
         onDelete={async (id) => { await deleteResource(id); await refreshResources(); }}
         onBack={() => setStep("browse")}
+        onRefreshBlobs={connectionParams ? handleRefreshBlobs : undefined}
       />
     );
   } else if (step === "dags") {
@@ -321,6 +355,13 @@ export default function Home() {
               </p>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={handleRefreshBlobs}
+                disabled={loading || !connectionParams}
+                className="text-sm bg-gray-600 hover:bg-gray-700 disabled:bg-gray-400 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                {loading ? "Refreshing…" : "Refresh blobs"}
+              </button>
               <button
                 onClick={() => setStep("history")}
                 className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
