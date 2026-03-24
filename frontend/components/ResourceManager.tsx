@@ -4,6 +4,10 @@ import type { BlobInfo, Resource } from "../lib/api";
 interface Props {
   resources: Resource[];
   blobs: BlobInfo[];
+  filteredBlobsByResource: Record<string, BlobInfo[]>;
+  autoDateByResource: Record<string, string>;
+  dateOverrides: Record<string, string>;
+  onDateOverridesChange: (overrides: Record<string, string>) => void;
   onCreate: (technicalName: string, businessName: string) => Promise<void>;
   onUpdate: (id: string, technicalName: string, businessName: string) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
@@ -74,7 +78,7 @@ function validateBatch(filteredBlobs: BlobInfo[]): ValidationResult {
   return { valid: issues.length === 0, issues };
 }
 
-export default function ResourceManager({ resources, blobs, onCreate, onUpdate, onDelete, onBack }: Props) {
+export default function ResourceManager({ resources, blobs, filteredBlobsByResource, autoDateByResource, dateOverrides, onDateOverridesChange, onCreate, onUpdate, onDelete, onBack }: Props) {
   const [editState, setEditState] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -84,10 +88,7 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
   const [newTechnical, setNewTechnical] = useState("");
   const [newBusiness, setNewBusiness] = useState("");
 
-  // Manual date override per resource (undefined = use auto, "" = all dates)
-  const [dateOverrides, setDateOverrides] = useState<Record<string, string>>({});
-
-  // Matching blobs per resource (unfiltered)
+  // Matching blobs per resource (unfiltered — used for date dropdown options)
   const matchingBlobsByResource = useMemo(() => {
     const result: Record<string, BlobInfo[]> = {};
     for (const r of resources) {
@@ -95,15 +96,6 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
     }
     return result;
   }, [resources, blobs]);
-
-  // Auto-detected batch start per resource
-  const autoDateByResource = useMemo(() => {
-    const result: Record<string, string> = {};
-    for (const r of resources) {
-      result[r.id] = detectBatchStart(matchingBlobsByResource[r.id] ?? []);
-    }
-    return result;
-  }, [resources, matchingBlobsByResource]);
 
   // Available dates per resource (sorted most recent first)
   const datesByResource = useMemo(() => {
@@ -129,20 +121,6 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
     if (resourceId in dateOverrides) return dateOverrides[resourceId];
     return autoDateByResource[resourceId] ?? "";
   };
-
-  // Filtered blobs per resource (>= effective filter date)
-  const filteredBlobsByResource = useMemo(() => {
-    const result: Record<string, BlobInfo[]> = {};
-    for (const r of resources) {
-      const matching = matchingBlobsByResource[r.id] ?? [];
-      const filter = effectiveFilter(r.id);
-      result[r.id] = filter
-        ? matching.filter((b) => (b.last_modified ?? "") >= filter)
-        : matching;
-    }
-    return result;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resources, matchingBlobsByResource, autoDateByResource, dateOverrides]);
 
   // Validation per resource
   const validationByResource = useMemo(() => {
@@ -362,13 +340,11 @@ export default function ResourceManager({ resources, blobs, onCreate, onUpdate, 
                       onChange={(e) => {
                         const val = e.target.value;
                         if (val === "__auto__") {
-                          setDateOverrides((prev) => {
-                            const next = { ...prev };
-                            delete next[r.id];
-                            return next;
-                          });
+                          const next = { ...dateOverrides };
+                          delete next[r.id];
+                          onDateOverridesChange(next);
                         } else {
-                          setDateOverrides((prev) => ({ ...prev, [r.id]: val }));
+                          onDateOverridesChange({ ...dateOverrides, [r.id]: val });
                         }
                       }}
                       className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-400"

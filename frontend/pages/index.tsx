@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import ConnectionForm from "../components/ConnectionForm";
 import FileBrowser from "../components/FileBrowser";
 import AnalysisConfig from "../components/AnalysisConfig";
+import AnalysisHistory from "../components/AnalysisHistory";
 import FlowResults from "../components/FlowResults";
 import LogPanel from "../components/LogPanel";
 import ResourceManager from "../components/ResourceManager";
@@ -21,7 +22,23 @@ import {
 } from "../lib/api";
 import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
-type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard";
+type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard" | "history";
+
+const GAP_MINUTES = 15;
+
+function detectBatchStart(matchingBlobs: BlobInfo[]): string {
+  const sorted = matchingBlobs
+    .filter((b) => b.last_modified)
+    .sort((a, b) => (a.last_modified ?? "").localeCompare(b.last_modified ?? ""));
+  if (sorted.length < 2) return "";
+  let lastGapIndex = -1;
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = new Date(sorted[i - 1].last_modified).getTime();
+    const curr = new Date(sorted[i].last_modified).getTime();
+    if ((curr - prev) / (1000 * 60) > GAP_MINUTES) lastGapIndex = i;
+  }
+  return lastGapIndex >= 0 ? sorted[lastGapIndex].last_modified : "";
+}
 
 export default function Home() {
   const [step, setStep] = useState<Step>("connect");
@@ -34,6 +51,45 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
 
   const [resources, setResources] = useState<Resource[]>([]);
+  const [initialConfig, setInitialConfig] = useState<{
+    keyColumns: string[];
+    filters: FilterCondition[];
+    deduplicate: boolean;
+    filterLogic: "AND" | "OR";
+  } | undefined>(undefined);
+
+  // Resource date filtering — shared across ResourceManager, VolumetryPanel, and profile handler
+  const [dateOverrides, setDateOverrides] = useState<Record<string, string>>({});
+
+  const matchingBlobsByResource = useMemo(() => {
+    const result: Record<string, BlobInfo[]> = {};
+    for (const r of resources) {
+      result[r.id] = blobs.filter((b) => b.name.startsWith(r.technical_name));
+    }
+    return result;
+  }, [resources, blobs]);
+
+  const autoDateByResource = useMemo(() => {
+    const result: Record<string, string> = {};
+    for (const r of resources) {
+      result[r.id] = detectBatchStart(matchingBlobsByResource[r.id] ?? []);
+    }
+    return result;
+  }, [resources, matchingBlobsByResource]);
+
+  const filteredBlobsByResource = useMemo(() => {
+    const result: Record<string, BlobInfo[]> = {};
+    for (const r of resources) {
+      const matching = matchingBlobsByResource[r.id] ?? [];
+      const filter = r.id in dateOverrides
+        ? dateOverrides[r.id]
+        : (autoDateByResource[r.id] ?? "");
+      result[r.id] = filter
+        ? matching.filter((b) => (b.last_modified ?? "") >= filter)
+        : matching;
+    }
+    return result;
+  }, [resources, matchingBlobsByResource, autoDateByResource, dateOverrides]);
 
   // Volumetry panel state — cleared when container changes
   const [volumetryPanelOpen, setVolumetryPanelOpen] = useState(false);
@@ -108,9 +164,7 @@ export default function Home() {
     const resource = resources.find((r) => r.id === resourceId);
     if (!resource || blobs.length === 0) return;
 
-    const matchingBlobNames = blobs
-      .filter((b) => b.name.startsWith(resource.technical_name))
-      .map((b) => b.name);
+    const matchingBlobNames = (filteredBlobsByResource[resourceId] ?? []).map((b) => b.name);
 
     if (matchingBlobNames.length === 0) return;
 
@@ -191,7 +245,34 @@ export default function Home() {
     setResult(null);
     setLogs([]);
     setError(null);
+    setInitialConfig(undefined);
     setStep("browse");
+  };
+
+  const handleLoadHistoryResult = (data: AnalyzeResultFull) => {
+    setResult(data);
+    setStep("results");
+  };
+
+  const handleUseAsTemplate = (config: {
+    containerUrl: string;
+    selectedBlobs: string[];
+    keyColumns: string[];
+    filters: FilterCondition[];
+    deduplicate: boolean;
+    filterLogic: "AND" | "OR";
+  }) => {
+    setInitialConfig({
+      keyColumns: config.keyColumns,
+      filters: config.filters,
+      deduplicate: config.deduplicate,
+      filterLogic: config.filterLogic,
+    });
+    // Pre-select the blobs if we're already connected to the same container
+    if (config.containerUrl === containerUrl) {
+      setSelected(new Set(config.selectedBlobs));
+    }
+    setStep("config");
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -204,6 +285,10 @@ export default function Home() {
       <ResourceManager
         resources={resources}
         blobs={blobs}
+        filteredBlobsByResource={filteredBlobsByResource}
+        autoDateByResource={autoDateByResource}
+        dateOverrides={dateOverrides}
+        onDateOverridesChange={setDateOverrides}
         onCreate={async (tn, bn) => { await createResource(tn, bn); await refreshResources(); }}
         onUpdate={async (id, tn, bn) => { await updateResource(id, tn, bn); await refreshResources(); }}
         onDelete={async (id) => { await deleteResource(id); await refreshResources(); }}
@@ -237,6 +322,12 @@ export default function Home() {
             </div>
             <div className="flex items-center gap-2">
               <button
+                onClick={() => setStep("history")}
+                className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                History
+              </button>
+              <button
                 onClick={() => setStep("dashboard")}
                 className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg transition-colors"
               >
@@ -269,6 +360,14 @@ export default function Home() {
         </div>
       </div>
     );
+  } else if (step === "history") {
+    content = (
+      <AnalysisHistory
+        onBack={() => setStep("browse")}
+        onLoadResult={handleLoadHistoryResult}
+        onUseAsTemplate={handleUseAsTemplate}
+      />
+    );
   } else if (step === "config") {
     content = (
       <AnalysisConfig
@@ -278,6 +377,7 @@ export default function Home() {
         onBack={() => { setError(null); setStep("browse"); }}
         loading={false}
         error={error}
+        initialConfig={initialConfig}
       />
     );
   } else if (step === "analyzing") {
@@ -314,7 +414,8 @@ export default function Home() {
         open={volumetryPanelOpen}
         onToggle={() => setVolumetryPanelOpen((p) => !p)}
         resources={resources}
-        blobs={blobs}
+        hasContainer={blobs.length > 0}
+        filteredBlobsByResource={filteredBlobsByResource}
         volumetryData={volumetryData}
         onRefresh={handleProfileResource}
       />

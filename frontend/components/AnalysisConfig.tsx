@@ -2,6 +2,13 @@ import { useState, useEffect } from "react";
 import { getBlobColumns, getBlobPreview } from "../lib/api";
 import type { FilterCondition, BlobPreview } from "../lib/api";
 
+interface InitialConfig {
+  keyColumns: string[];
+  filters: FilterCondition[];
+  deduplicate: boolean;
+  filterLogic: "AND" | "OR";
+}
+
 interface Props {
   containerUrl: string;
   selectedBlobs: string[];
@@ -14,6 +21,7 @@ interface Props {
   onBack: () => void;
   loading: boolean;
   error: string | null;
+  initialConfig?: InitialConfig;
 }
 
 export default function AnalysisConfig({
@@ -23,17 +31,18 @@ export default function AnalysisConfig({
   onBack,
   loading,
   error,
+  initialConfig,
 }: Props) {
   const [columns, setColumns] = useState<string[]>([]);
   const [columnsLoading, setColumnsLoading] = useState(true);
   const [columnsError, setColumnsError] = useState<string | null>(null);
 
-  const [keyColumns, setKeyColumns] = useState<string[]>([]);
-  const [filters, setFilters] = useState<FilterCondition[]>([
-    { column: "", value: "", filter_type: "equals" },
-  ]);
-  const [filterLogic, setFilterLogic] = useState<"AND" | "OR">("AND");
-  const [deduplicate, setDeduplicate] = useState(true);
+  const [keyColumns, setKeyColumns] = useState<string[]>(initialConfig?.keyColumns ?? []);
+  const [filters, setFilters] = useState<FilterCondition[]>(
+    initialConfig?.filters?.length ? initialConfig.filters : [{ column: "", value: "", filter_type: "equals" }]
+  );
+  const [filterLogic, setFilterLogic] = useState<"AND" | "OR">(initialConfig?.filterLogic ?? "AND");
+  const [deduplicate, setDeduplicate] = useState(initialConfig?.deduplicate ?? true);
 
   // Preview state
   const [previewBlob, setPreviewBlob] = useState<string>(selectedBlobs[0] ?? "");
