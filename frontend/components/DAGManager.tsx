@@ -41,11 +41,12 @@ export default function DAGManager({ onBack }: Props) {
     setSaving(true);
     setError(null);
     try {
-      await createDag(newDagId.trim(), newDisplayName.trim());
-      await refresh();
+      const created = await createDag(newDagId.trim(), newDisplayName.trim());
+      setDags((prev) => [...prev, created]);
       setNewDagId("");
       setNewDisplayName("");
       setShowNew(false);
+      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Create failed");
     } finally {
@@ -58,9 +59,10 @@ export default function DAGManager({ onBack }: Props) {
     setSaving(true);
     setError(null);
     try {
-      await updateDag(editState.id, editState.dag_id.trim(), editState.display_name.trim());
-      await refresh();
+      const updated = await updateDag(editState.id, editState.dag_id.trim(), editState.display_name.trim());
+      setDags((prev) => prev.map((d) => (d.id === updated.id ? updated : d)));
       setEditState(null);
+      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Save failed");
     } finally {
@@ -73,7 +75,8 @@ export default function DAGManager({ onBack }: Props) {
     setError(null);
     try {
       await deleteDag(id);
-      await refresh();
+      setDags((prev) => prev.filter((d) => d.id !== id));
+      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Delete failed");
     } finally {
