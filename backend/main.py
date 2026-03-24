@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -18,6 +19,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+BLOB_CACHE_DIR = Path(".cache/dataflow/blobs")
+HISTORY_DIR = Path(".data/history")
 
 # Pipeline stage order (most specific names first for detection; order reflects pipeline flow)
 STAGE_ORDER = [
@@ -149,6 +153,15 @@ class AnalyzeRequest(BaseModel):
     filters: List[FilterCondition]
     deduplicate: bool = True
     filter_logic: str = "AND"  # "AND" | "OR"
+    force_refresh: bool = False  # bypass blob cache
+
+
+class HistorySummary(BaseModel):
+    id: str
+    saved_at: str
+    container_url: str
+    blob_count: int
+    key_columns: List[str]
 
 
 class ColumnsRequest(BaseModel):
@@ -983,6 +996,13 @@ def _apply_single_filter(df: pl.DataFrame, f: FilterCondition) -> pl.DataFrame:
         return df.filter(pl.col(f.column).cast(pl.Utf8) == f.value)
 
 
+def _blob_cache_path(container_url: str, blob_name: str) -> Path:
+    """Return the persistent cache path for a blob."""
+    slug = hashlib.md5(container_url.encode()).hexdigest()[:12]
+    safe = blob_name.replace("/", "__").replace("\\", "__")
+    return BLOB_CACHE_DIR / slug / safe
+
+
 def _download_blob_to_disk(blob_client, local_path: str) -> int:
     """Download a blob and save it to disk. Returns file size in bytes. Runs sync — use to_thread."""
     raw = blob_client.download_blob().readall()
@@ -1123,7 +1143,8 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
         raise HTTPException(status_code=400, detail="No blobs selected.")
 
     async def generate() -> AsyncGenerator[str, None]:
-        tmp_dir = tempfile.mkdtemp(prefix="dataflow_")
+        BLOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         downloaded_files: List[str] = []
 
         try:
@@ -1142,8 +1163,8 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                 f"{len(stage_blobs)} stage(s): {', '.join(stage_blobs.keys())}."
             )
 
-            # ── 2. Download → disk, merge, filter, dedup per stage ────────────
-            stage_dfs: Dict[str, pd.DataFrame] = {}
+            # ── 2. Download → disk (or reuse cache), merge, filter, dedup per stage ──
+            stage_dfs: Dict[str, pl.DataFrame] = {}
             dedup_warnings: Dict[str, Dict[str, int]] = {}
             active_filters = [f for f in request.filters if f.column and f.value]
 
@@ -1151,20 +1172,19 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                 local_paths: List[str] = []
 
                 for blob_name in blobs:
-                    yield _log(f"[{stage}] Downloading {blob_name}…")
-                    blob_client = client.get_blob_client(blob_name)
-                    safe_name = blob_name.replace("/", "__").replace("\\", "__")
-                    local_path = os.path.join(tmp_dir, safe_name)
-
-                    size_bytes = await asyncio.to_thread(
-                        _download_blob_to_disk, blob_client, local_path
-                    )
-                    downloaded_files.append(local_path)
-                    local_paths.append(local_path)
-                    yield _log(
-                        f"[{stage}] Saved → {local_path}  ({size_bytes / 1024:.1f} KB)",
-                        "success",
-                    )
+                    cache_path = _blob_cache_path(request.container_url, blob_name)
+                    if cache_path.exists() and not request.force_refresh:
+                        yield _log(f"[{stage}] {blob_name} — using cached file", "info")
+                    else:
+                        yield _log(f"[{stage}] Downloading {blob_name}…")
+                        blob_client = client.get_blob_client(blob_name)
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        size_bytes = await asyncio.to_thread(
+                            _download_blob_to_disk, blob_client, str(cache_path)
+                        )
+                        yield _log(f"[{stage}] Saved ({size_bytes / 1024:.1f} KB)", "success")
+                    downloaded_files.append(str(cache_path))
+                    local_paths.append(str(cache_path))
 
                 yield _log(f"[{stage}] Merging and processing {len(local_paths)} file(s)…")
                 merged, dedup_info, stage_logs = await asyncio.to_thread(
@@ -1197,18 +1217,33 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                 "success",
             )
 
-            # ── 4. Emit final result ───────────────────────────────────────────
+            # ── 4. Save to history and emit final result ──────────────────────
+            result_data = {
+                "stages": ordered_stages,
+                "key_columns": request.key_columns,
+                "rows": rows,
+                "columns": columns_per_stage,
+                "dedup_warnings": dedup_warnings,
+            }
+            entry_id = str(uuid.uuid4())
+            (HISTORY_DIR / f"{entry_id}.json").write_text(
+                json.dumps(
+                    {
+                        "id": entry_id,
+                        "saved_at": datetime.now(timezone.utc).isoformat(),
+                        "request": request.model_dump(),
+                        "result": result_data,
+                    },
+                    default=str,
+                )
+            )
+
             yield _sse({
                 "type": "result",
-                "data": {
-                    "stages": ordered_stages,
-                    "key_columns": request.key_columns,
-                    "rows": rows,
-                    "columns": columns_per_stage,
-                    "dedup_warnings": dedup_warnings,
-                },
+                "data": result_data,
                 "downloaded_files": downloaded_files,
-                "tmp_dir": tmp_dir,
+                "tmp_dir": str(BLOB_CACHE_DIR),
+                "history_id": entry_id,
             })
 
         except AzureError as e:
@@ -1221,3 +1256,40 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Analysis history ──────────────────────────────────────────────────────────
+
+@app.get("/api/history")
+async def list_history() -> List[HistorySummary]:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    summaries: List[HistorySummary] = []
+    for f in sorted(HISTORY_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(f.read_text())
+            summaries.append(HistorySummary(
+                id=data["id"],
+                saved_at=data["saved_at"],
+                container_url=data["request"]["container_url"],
+                blob_count=len(data["request"]["selected_blobs"]),
+                key_columns=data["request"]["key_columns"],
+            ))
+        except Exception:
+            pass
+    return summaries
+
+
+@app.get("/api/history/{entry_id}")
+async def get_history_entry(entry_id: str):
+    path = HISTORY_DIR / f"{entry_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="History entry not found")
+    return json.loads(path.read_text())
+
+
+@app.delete("/api/history/{entry_id}", status_code=204)
+async def delete_history_entry(entry_id: str):
+    path = HISTORY_DIR / f"{entry_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="History entry not found")
+    path.unlink()

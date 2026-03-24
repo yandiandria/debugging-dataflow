@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import ConnectionForm from "../components/ConnectionForm";
 import FileBrowser from "../components/FileBrowser";
 import AnalysisConfig from "../components/AnalysisConfig";
+import AnalysisHistory from "../components/AnalysisHistory";
 import FlowResults from "../components/FlowResults";
 import LogPanel from "../components/LogPanel";
 import ResourceManager from "../components/ResourceManager";
@@ -21,7 +22,7 @@ import {
 } from "../lib/api";
 import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
 
-type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard";
+type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard" | "history";
 
 const GAP_MINUTES = 15;
 
@@ -50,6 +51,12 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
 
   const [resources, setResources] = useState<Resource[]>([]);
+  const [initialConfig, setInitialConfig] = useState<{
+    keyColumns: string[];
+    filters: FilterCondition[];
+    deduplicate: boolean;
+    filterLogic: "AND" | "OR";
+  } | undefined>(undefined);
 
   // Resource date filtering — shared across ResourceManager, VolumetryPanel, and profile handler
   const [dateOverrides, setDateOverrides] = useState<Record<string, string>>({});
@@ -238,7 +245,34 @@ export default function Home() {
     setResult(null);
     setLogs([]);
     setError(null);
+    setInitialConfig(undefined);
     setStep("browse");
+  };
+
+  const handleLoadHistoryResult = (data: AnalyzeResultFull) => {
+    setResult(data);
+    setStep("results");
+  };
+
+  const handleUseAsTemplate = (config: {
+    containerUrl: string;
+    selectedBlobs: string[];
+    keyColumns: string[];
+    filters: FilterCondition[];
+    deduplicate: boolean;
+    filterLogic: "AND" | "OR";
+  }) => {
+    setInitialConfig({
+      keyColumns: config.keyColumns,
+      filters: config.filters,
+      deduplicate: config.deduplicate,
+      filterLogic: config.filterLogic,
+    });
+    // Pre-select the blobs if we're already connected to the same container
+    if (config.containerUrl === containerUrl) {
+      setSelected(new Set(config.selectedBlobs));
+    }
+    setStep("config");
   };
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -288,6 +322,12 @@ export default function Home() {
             </div>
             <div className="flex items-center gap-2">
               <button
+                onClick={() => setStep("history")}
+                className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+              >
+                History
+              </button>
+              <button
                 onClick={() => setStep("dashboard")}
                 className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg transition-colors"
               >
@@ -320,6 +360,14 @@ export default function Home() {
         </div>
       </div>
     );
+  } else if (step === "history") {
+    content = (
+      <AnalysisHistory
+        onBack={() => setStep("browse")}
+        onLoadResult={handleLoadHistoryResult}
+        onUseAsTemplate={handleUseAsTemplate}
+      />
+    );
   } else if (step === "config") {
     content = (
       <AnalysisConfig
@@ -329,6 +377,7 @@ export default function Home() {
         onBack={() => { setError(null); setStep("browse"); }}
         loading={false}
         error={error}
+        initialConfig={initialConfig}
       />
     );
   } else if (step === "analyzing") {

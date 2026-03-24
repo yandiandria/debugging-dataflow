@@ -32,6 +32,30 @@ export interface AnalyzeResult {
 export interface AnalyzeResultFull extends AnalyzeResult {
   downloaded_files: string[];
   tmp_dir: string;
+  history_id?: string;
+}
+
+export interface HistorySummary {
+  id: string;
+  saved_at: string;
+  container_url: string;
+  blob_count: number;
+  key_columns: string[];
+}
+
+export interface HistoryEntry {
+  id: string;
+  saved_at: string;
+  request: {
+    container_url: string;
+    selected_blobs: string[];
+    key_columns: string[];
+    filters: FilterCondition[];
+    deduplicate: boolean;
+    filter_logic: "AND" | "OR";
+    force_refresh: boolean;
+  };
+  result: AnalyzeResult;
 }
 
 export interface LogEntry {
@@ -313,6 +337,7 @@ export async function analyzeStream(
     filters: FilterCondition[];
     deduplicate: boolean;
     filter_logic: "AND" | "OR";
+    force_refresh?: boolean;
   },
   onLog: (entry: LogEntry) => void,
   onResult: (result: AnalyzeResultFull) => void,
@@ -664,4 +689,25 @@ export async function getColumnValues(
   });
   if (!res.ok) throw new Error("Failed to get column values");
   return res.json();
+}
+
+// ── Analysis history ──────────────────────────────────────────────────────────
+
+export async function listHistory(): Promise<HistorySummary[]> {
+  const res = await fetch(`${BASE_URL}/api/history`);
+  if (!res.ok) throw new Error("Failed to load history");
+  return res.json();
+}
+
+export async function getHistoryEntry(id: string): Promise<HistoryEntry> {
+  const res = await fetch(`${BASE_URL}/api/history/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error("History entry not found");
+  return res.json();
+}
+
+export async function deleteHistoryEntry(id: string): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/history/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error("Failed to delete history entry");
 }
