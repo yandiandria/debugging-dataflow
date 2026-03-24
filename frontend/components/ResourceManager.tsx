@@ -111,7 +111,7 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
         const iso = b.last_modified ?? "";
         if (!iso || seen.has(iso)) continue;
         seen.add(iso);
-        dates.push({ iso, label: new Date(iso).toLocaleString() });
+        dates.push({ iso, label: iso.slice(0, 16).replace("T", " ") });
       }
       dates.sort((a, b) => b.iso.localeCompare(a.iso));
       result[r.id] = dates;
@@ -416,7 +416,7 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
                       className="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-400"
                     >
                       <option value="__auto__">
-                        Auto{autoDate ? ` (${new Date(autoDate).toLocaleString()})` : ""}
+                        Auto{autoDate ? ` (${autoDate.slice(0, 16).replace("T", " ")})` : ""}
                       </option>
                       <option value="">All dates</option>
                       {dates.map((d) => (
