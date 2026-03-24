@@ -8,16 +8,18 @@ interface Props {
   autoDateByResource: Record<string, string>;
   dateOverrides: Record<string, string>;
   onDateOverridesChange: (overrides: Record<string, string>) => void;
-  onCreate: (technicalName: string, businessName: string) => Promise<void>;
-  onUpdate: (id: string, technicalName: string, businessName: string) => Promise<void>;
+  onCreate: (technicalName: string, businessName: string, extractPrefixes?: string[]) => Promise<void>;
+  onUpdate: (id: string, technicalName: string, businessName: string, extractPrefixes?: string[]) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   onBack: () => void;
+  onRefreshBlobs?: () => void;
 }
 
 interface EditState {
   id: string;
   technical_name: string;
   business_name: string;
+  extract_prefixes_text: string;
 }
 
 const GAP_MINUTES = 15;
@@ -78,7 +80,7 @@ function validateBatch(filteredBlobs: BlobInfo[]): ValidationResult {
   return { valid: issues.length === 0, issues };
 }
 
-export default function ResourceManager({ resources, blobs, filteredBlobsByResource, autoDateByResource, dateOverrides, onDateOverridesChange, onCreate, onUpdate, onDelete, onBack }: Props) {
+export default function ResourceManager({ resources, blobs, filteredBlobsByResource, autoDateByResource, dateOverrides, onDateOverridesChange, onCreate, onUpdate, onDelete, onBack, onRefreshBlobs }: Props) {
   const [editState, setEditState] = useState<EditState | null>(null);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -87,6 +89,7 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
   const [showNew, setShowNew] = useState(false);
   const [newTechnical, setNewTechnical] = useState("");
   const [newBusiness, setNewBusiness] = useState("");
+  const [newExtractPrefixesText, setNewExtractPrefixesText] = useState("");
 
   // Matching blobs per resource (unfiltered — used for date dropdown options)
   const matchingBlobsByResource = useMemo(() => {
@@ -132,7 +135,12 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
   }, [resources, filteredBlobsByResource]);
 
   const startEdit = (r: Resource) => {
-    setEditState({ id: r.id, technical_name: r.technical_name, business_name: r.business_name });
+    setEditState({
+      id: r.id,
+      technical_name: r.technical_name,
+      business_name: r.business_name,
+      extract_prefixes_text: (r.extract_prefixes ?? []).join("\n"),
+    });
     setError(null);
   };
 
@@ -143,7 +151,9 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
     setSaving(true);
     setError(null);
     try {
-      await onUpdate(editState.id, editState.technical_name.trim(), editState.business_name.trim());
+      const extractPrefixes = editState.extract_prefixes_text
+        .split("\n").map((s) => s.trim()).filter(Boolean);
+      await onUpdate(editState.id, editState.technical_name.trim(), editState.business_name.trim(), extractPrefixes);
       setEditState(null);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Save failed");
@@ -169,9 +179,12 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
     setSaving(true);
     setError(null);
     try {
-      await onCreate(newTechnical.trim(), newBusiness.trim());
+      const extractPrefixes = newExtractPrefixesText
+        .split("\n").map((s) => s.trim()).filter(Boolean);
+      await onCreate(newTechnical.trim(), newBusiness.trim(), extractPrefixes.length > 0 ? extractPrefixes : undefined);
       setNewTechnical("");
       setNewBusiness("");
+      setNewExtractPrefixesText("");
       setShowNew(false);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Create failed");
@@ -197,12 +210,22 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
             {resources.length} resource{resources.length !== 1 ? "s" : ""}
           </span>
         </div>
-        <button
-          onClick={() => { setShowNew(true); setError(null); }}
-          className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-        >
-          + New resource
-        </button>
+        <div className="flex gap-2">
+          {onRefreshBlobs && (
+            <button
+              onClick={onRefreshBlobs}
+              className="text-sm bg-gray-600 hover:bg-gray-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+            >
+              Refresh blobs
+            </button>
+          )}
+          <button
+            onClick={() => { setShowNew(true); setError(null); }}
+            className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+          >
+            + New resource
+          </button>
+        </div>
       </div>
 
       <div className="max-w-3xl mx-auto px-6 py-6">
@@ -222,36 +245,51 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
 
           {/* New resource row */}
           {showNew && (
-            <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-3 border-b border-teal-100 bg-teal-50 items-center">
-              <input
-                type="text"
-                placeholder="Business name"
-                value={newBusiness}
-                onChange={(e) => setNewBusiness(e.target.value)}
-                autoFocus
-                className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-teal-400"
-              />
-              <input
-                type="text"
-                placeholder="Technical name (prefix)"
-                value={newTechnical}
-                onChange={(e) => setNewTechnical(e.target.value)}
-                className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-teal-400"
-              />
-              <div className="flex gap-2">
-                <button
-                  onClick={handleCreate}
-                  disabled={saving || !newBusiness.trim() || !newTechnical.trim()}
-                  className="text-sm px-3 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:bg-teal-300 text-white rounded-lg transition-colors"
-                >
-                  {saving ? "Saving…" : "Save"}
-                </button>
-                <button
-                  onClick={() => { setShowNew(false); setNewBusiness(""); setNewTechnical(""); }}
-                  className="text-sm px-3 py-1.5 text-gray-500 hover:text-gray-700 border border-gray-200 rounded-lg transition-colors"
-                >
-                  Cancel
-                </button>
+            <div className="px-4 py-3 border-b border-teal-100 bg-teal-50">
+              <div className="grid grid-cols-[1fr_1fr_auto] gap-4 items-start">
+                <input
+                  type="text"
+                  placeholder="Business name"
+                  value={newBusiness}
+                  onChange={(e) => setNewBusiness(e.target.value)}
+                  autoFocus
+                  className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-teal-400"
+                />
+                <input
+                  type="text"
+                  placeholder="Technical name (prefix)"
+                  value={newTechnical}
+                  onChange={(e) => setNewTechnical(e.target.value)}
+                  className="border border-teal-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-teal-400"
+                />
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleCreate}
+                    disabled={saving || !newBusiness.trim() || !newTechnical.trim()}
+                    className="text-sm px-3 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:bg-teal-300 text-white rounded-lg transition-colors"
+                  >
+                    {saving ? "Saving…" : "Save"}
+                  </button>
+                  <button
+                    onClick={() => { setShowNew(false); setNewBusiness(""); setNewTechnical(""); setNewExtractPrefixesText(""); }}
+                    className="text-sm px-3 py-1.5 text-gray-500 hover:text-gray-700 border border-gray-200 rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              <div className="mt-2">
+                <label className="block text-xs text-teal-700 font-medium mb-1">
+                  Extract-only prefixes <span className="font-normal text-teal-500">(optional — one per line)</span>
+                </label>
+                <textarea
+                  rows={2}
+                  placeholder={"e.g.\nother/exports/\nraw/dump/"}
+                  value={newExtractPrefixesText}
+                  onChange={(e) => setNewExtractPrefixesText(e.target.value)}
+                  className="w-full border border-teal-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-teal-400 resize-none"
+                />
+                <p className="text-xs text-teal-500 mt-0.5">Additional Azure prefixes for this resource — only extract-stage files are kept.</p>
               </div>
             </div>
           )}
@@ -331,6 +369,34 @@ export default function ResourceManager({ resources, blobs, filteredBlobsByResou
                     </>
                   )}
                 </div>
+
+                {/* Extract-only prefixes — edit mode */}
+                {isEditing && (
+                  <div className="px-4 pb-3">
+                    <label className="block text-xs text-blue-700 font-medium mb-1">
+                      Extract-only prefixes <span className="font-normal text-blue-400">(optional — one per line)</span>
+                    </label>
+                    <textarea
+                      rows={2}
+                      placeholder={"e.g.\nother/exports/\nraw/dump/"}
+                      value={editState.extract_prefixes_text}
+                      onChange={(e) => setEditState({ ...editState, extract_prefixes_text: e.target.value })}
+                      className="w-full border border-blue-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none"
+                    />
+                    <p className="text-xs text-blue-400 mt-0.5">Additional Azure prefixes for this resource — only extract-stage files are kept.</p>
+                  </div>
+                )}
+
+                {/* Extract-only prefixes — view mode (when configured) */}
+                {!isEditing && (r.extract_prefixes ?? []).length > 0 && (
+                  <div className="px-4 pb-1 flex flex-wrap gap-1">
+                    {(r.extract_prefixes ?? []).map((p) => (
+                      <span key={p} className="text-xs font-mono bg-indigo-50 text-indigo-600 border border-indigo-200 px-2 py-0.5 rounded">
+                        {p}
+                      </span>
+                    ))}
+                  </div>
+                )}
 
                 {/* Date filter */}
                 {!isEditing && dates.length > 0 && (
