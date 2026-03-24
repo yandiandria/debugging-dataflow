@@ -69,6 +69,7 @@ export async function listBlobs(
   dateFrom?: string,
   dateTo?: string,
   prefix?: string,
+  extractPrefixes?: string[],
 ): Promise<BlobInfo[]> {
   const res = await fetch(`${BASE_URL}/api/blobs/list`, {
     method: "POST",
@@ -76,6 +77,7 @@ export async function listBlobs(
     body: JSON.stringify({
       container_url: containerUrl,
       ...(prefix && { prefix }),
+      ...(extractPrefixes && extractPrefixes.length > 0 && { extract_prefixes: extractPrefixes }),
       ...(dateFrom && { date_from: dateFrom }),
       ...(dateTo && { date_to: dateTo }),
     }),

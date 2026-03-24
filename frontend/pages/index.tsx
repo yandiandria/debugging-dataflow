@@ -103,11 +103,11 @@ export default function Home() {
   const refreshResources = () => getResources().then(setResources).catch(() => {});
 
   // ── Step 1: connect ────────────────────────────────────────────────────────
-  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string, prefix?: string) => {
+  const handleConnect = async (url: string, dateFrom?: string, dateTo?: string, prefix?: string, extractPrefixes?: string[]) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await listBlobs(url, dateFrom, dateTo, prefix);
+      const data = await listBlobs(url, dateFrom, dateTo, prefix, extractPrefixes);
       setContainerUrl(url);
       setBlobs(data);
       setSelected(new Set());

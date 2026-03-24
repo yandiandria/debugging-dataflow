@@ -2,9 +2,10 @@ import { useState, useEffect } from "react";
 
 const STORAGE_KEY = "dataflow_container_url";
 const STORAGE_PREFIX_KEY = "dataflow_prefix";
+const STORAGE_EXTRACT_PREFIXES_KEY = "dataflow_extract_prefixes";
 
 interface Props {
-  onConnect: (containerUrl: string, dateFrom?: string, dateTo?: string, prefix?: string) => void;
+  onConnect: (containerUrl: string, dateFrom?: string, dateTo?: string, prefix?: string, extractPrefixes?: string[]) => void;
   loading: boolean;
   error: string | null;
 }
@@ -16,6 +17,9 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
   const [prefix, setPrefix] = useState(() =>
     typeof window !== "undefined" ? localStorage.getItem(STORAGE_PREFIX_KEY) ?? "" : ""
   );
+  const [extractPrefixesText, setExtractPrefixesText] = useState(() =>
+    typeof window !== "undefined" ? localStorage.getItem(STORAGE_EXTRACT_PREFIXES_KEY) ?? "" : ""
+  );
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
 
@@ -26,7 +30,19 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
       localStorage.setItem(STORAGE_KEY, url);
       if (prefix.trim()) localStorage.setItem(STORAGE_PREFIX_KEY, prefix.trim());
       else localStorage.removeItem(STORAGE_PREFIX_KEY);
-      onConnect(url, dateFrom || undefined, dateTo || undefined, prefix.trim() || undefined);
+      const extractPrefixes = extractPrefixesText
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (extractPrefixes.length > 0) localStorage.setItem(STORAGE_EXTRACT_PREFIXES_KEY, extractPrefixesText.trim());
+      else localStorage.removeItem(STORAGE_EXTRACT_PREFIXES_KEY);
+      onConnect(
+        url,
+        dateFrom || undefined,
+        dateTo || undefined,
+        prefix.trim() || undefined,
+        extractPrefixes.length > 0 ? extractPrefixes : undefined,
+      );
     }
   };
 
@@ -73,7 +89,7 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
 
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              Path prefix <span className="text-gray-400 font-normal">(optional)</span>
+              Path prefix <span className="text-gray-400 font-normal">(optional — all stages)</span>
             </label>
             <input
               type="text"
@@ -84,6 +100,22 @@ export default function ConnectionForm({ onConnect, loading, error }: Props) {
             />
             <p className="text-xs text-gray-400 mt-1">
               Filters blobs at the Azure level — use this to speed up listing on large containers.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Extract-only prefixes <span className="text-gray-400 font-normal">(optional — one per line)</span>
+            </label>
+            <textarea
+              className="w-full border border-gray-300 rounded-lg p-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+              rows={3}
+              placeholder={"e.g.\nother/exports/\nraw/dump/"}
+              value={extractPrefixesText}
+              onChange={(e) => setExtractPrefixesText(e.target.value)}
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              Additional prefixes fetched from Azure — only extract-stage files are kept.
             </p>
           </div>
 

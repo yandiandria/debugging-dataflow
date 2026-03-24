@@ -128,9 +128,10 @@ class ResourceCreate(BaseModel):
 
 class BlobListRequest(BaseModel):
     container_url: str
-    prefix: Optional[str] = None     # Azure-side path prefix filter
-    date_from: Optional[str] = None  # ISO date string, e.g. "2024-01-15"
-    date_to: Optional[str] = None    # ISO date string, inclusive
+    prefix: Optional[str] = None           # Azure-side path prefix filter (all stages)
+    extract_prefixes: List[str] = []       # Extra prefixes — only extract-stage blobs kept
+    date_from: Optional[str] = None        # ISO date string, e.g. "2024-01-15"
+    date_to: Optional[str] = None          # ISO date string, inclusive
 
 
 class BlobInfo(BaseModel):
@@ -818,22 +819,38 @@ async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
         )
 
         client = build_container_client(request.container_url)
+        seen: set = set()
         blobs: List[BlobInfo] = []
-        for blob in client.list_blobs(name_starts_with=request.prefix or None):
-            if not blob.name.lower().endswith(".csv"):
-                continue
-            lm = blob.last_modified
-            if lm:
-                if date_from and lm < date_from:
+
+        def _collect(name_starts_with: Optional[str], extract_only: bool = False) -> None:
+            for blob in client.list_blobs(name_starts_with=name_starts_with):
+                if not blob.name.lower().endswith(".csv"):
                     continue
-                if date_to and lm > date_to:
+                lm = blob.last_modified
+                if lm:
+                    if date_from and lm < date_from:
+                        continue
+                    if date_to and lm > date_to:
+                        continue
+                if blob.name in seen:
                     continue
-            blobs.append(BlobInfo(
-                name=blob.name,
-                size=blob.size or 0,
-                last_modified=lm.isoformat() if lm else "",
-                detected_stage=detect_stage(blob.name),
-            ))
+                stage = detect_stage(blob.name)
+                if extract_only and stage != "extract":
+                    continue
+                seen.add(blob.name)
+                blobs.append(BlobInfo(
+                    name=blob.name,
+                    size=blob.size or 0,
+                    last_modified=lm.isoformat() if lm else "",
+                    detected_stage=stage,
+                ))
+
+        _collect(request.prefix or None)
+        for ep in request.extract_prefixes:
+            ep = ep.strip()
+            if ep:
+                _collect(ep, extract_only=True)
+
         return blobs
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
