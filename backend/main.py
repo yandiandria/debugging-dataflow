@@ -1104,7 +1104,7 @@ def _build_flow_report(
             stage_lookup[stage] = {}
             continue
         records = df.to_dicts()
-        str_key_rows = df.select([pl.col(k).cast(pl.Utf8) for k in valid_keys]).to_dicts()
+        str_key_rows = df.select([pl.col(k).cast(pl.Utf8).fill_null("") for k in valid_keys]).to_dicts()
         lookup: Dict[tuple, dict] = {}
         for i, key_row in enumerate(str_key_rows):
             key_tuple = tuple((k, key_row[k]) for k in valid_keys)
