@@ -1054,14 +1054,25 @@ def _build_flow_report(
     dedup_warnings: Dict[str, Dict[str, int]],
 ) -> tuple:
     """Collect unique key tuples and build per-record flow. Returns (rows, columns_per_stage). Runs sync — use to_thread."""
+    # Pre-build a lookup dict per stage: key_tuple -> first matching row dict
+    # This avoids O(keys * stages * rows) mask scans in the original nested loop.
+    stage_lookup: Dict[str, Dict[tuple, dict]] = {}
     all_key_tuples: set = set()
+
     for stage, df in stage_dfs.items():
         valid_keys = [k for k in key_columns if k in df.columns]
         if not valid_keys:
+            stage_lookup[stage] = {}
             continue
-        for _, row in df.iterrows():
-            key_tuple = tuple((k, str(row[k])) for k in valid_keys)
+        records = json.loads(df.to_json(orient="records"))
+        str_cols = df[valid_keys].astype(str)
+        lookup: Dict[tuple, dict] = {}
+        for i, key_row in enumerate(str_cols.itertuples(index=False, name=None)):
+            key_tuple = tuple(zip(valid_keys, key_row))
+            if key_tuple not in lookup:
+                lookup[key_tuple] = records[i]
             all_key_tuples.add(key_tuple)
+        stage_lookup[stage] = lookup
 
     rows = []
     for key_tuple in sorted(all_key_tuples):
@@ -1071,20 +1082,11 @@ def _build_flow_report(
         last_seen_stage: Optional[str] = None
 
         for stage in ordered_stages:
-            df = stage_dfs[stage]
-            valid_keys = [k for k in key_columns if k in df.columns]
-            if not valid_keys:
-                missing_stages.append(stage)
-                continue
-            mask = pd.Series(True, index=df.index)
-            for k in valid_keys:
-                if k in key_dict:
-                    mask &= df[k].astype(str) == key_dict[k]
-            matches = df[mask]
-            if matches.empty:
+            row_data = stage_lookup.get(stage, {}).get(key_tuple)
+            if row_data is None:
                 missing_stages.append(stage)
             else:
-                flow[stage] = json.loads(matches.iloc[[0]].to_json(orient="records"))[0]
+                flow[stage] = row_data
                 last_seen_stage = stage
 
         rows.append({
