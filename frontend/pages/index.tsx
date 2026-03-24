@@ -73,7 +73,12 @@ export default function Home() {
   const matchingBlobsByResource = useMemo(() => {
     const result: Record<string, BlobInfo[]> = {};
     for (const r of resources) {
-      result[r.id] = blobs.filter((b) => b.name.startsWith(r.technical_name));
+      const eps = r.extract_prefixes ?? [];
+      result[r.id] = blobs.filter(
+        (b) =>
+          b.name.startsWith(r.technical_name) ||
+          eps.some((p) => p.trim() && b.name.startsWith(p.trim()))
+      );
     }
     return result;
   }, [resources, blobs]);
