@@ -282,9 +282,13 @@ export default function DAGManager({ onBack }: Props) {
           {dags.map((d) => {
             const isEditing = editState?.id === d.id;
             const isDeleting = deletingId === d.id;
+            const cmd = config.container_name
+              ? `docker exec ${config.container_name} airflow dags trigger ${d.dag_id} --conf '{"padoa_env": "<env>"}'`
+              : null;
 
             return (
-              <div key={d.id} className={`grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-3 border-b border-gray-100 last:border-b-0 items-center ${isEditing ? "bg-blue-50" : ""}`}>
+              <div key={d.id} className={`border-b border-gray-100 last:border-b-0 ${isEditing ? "bg-blue-50" : ""}`}>
+                <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-3 items-center">
                 {isEditing ? (
                   <>
                     <input
@@ -329,6 +333,14 @@ export default function DAGManager({ onBack }: Props) {
                       </button>
                     </div>
                   </>
+                )}
+                </div>
+                {!isEditing && (
+                  <div className="px-4 pb-2.5">
+                    <code className={`text-xs font-mono ${cmd ? "text-gray-400" : "text-gray-300 italic"}`}>
+                      {cmd ?? "docker exec <container> airflow dags trigger " + d.dag_id + " --conf '{\"padoa_env\": \"<env>\"}'"}
+                    </code>
+                  </div>
                 )}
               </div>
             );
