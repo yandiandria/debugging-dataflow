@@ -650,15 +650,20 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
                     yield _log(line, "warning")
 
             if proc.returncode == 0:
-                # Try to extract run_id from output
+                # Try to extract run_id from output.
+                # Airflow 2.x format: "Created <DagRun dag_id @ exec_date: run_id, externally triggered: True>"
                 run_id = ""
                 for line in stdout_text.split("\n"):
-                    if "run_id" in line.lower() or "dag_run" in line.lower():
-                        # Common airflow output: "Created <DagRun ... run_id=manual__2024-..."
-                        match = re.search(r"run_id[=:\s]+(\S+)", line)
-                        if match:
-                            run_id = match.group(1).strip(",").strip("'\"")
-                            break
+                    # Primary: parse the DagRun repr produced by `airflow dags trigger`
+                    match = re.search(r"<DagRun [^>]+ @ [^:]+:\s+([^,>]+)", line)
+                    if match:
+                        run_id = match.group(1).strip()
+                        break
+                    # Fallback: explicit run_id= / run_id: pattern
+                    match = re.search(r"run_id[=:\s]+(\S+)", line)
+                    if match:
+                        run_id = match.group(1).strip(",").strip("'\"")
+                        break
 
                 # Save run record, pruning old entries to cap file size
                 runs = _load_json(DAG_RUNS_FILE)
