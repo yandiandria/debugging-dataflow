@@ -567,6 +567,16 @@ export async function triggerDagStream(
   }
 }
 
+export async function getLatestAirflowRunId(dagId: string): Promise<string> {
+  const res = await fetch(`${BASE_URL}/api/dags/${encodeURIComponent(dagId)}/latest-run-id`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to get latest run ID");
+  }
+  const data = await res.json();
+  return data.run_id as string;
+}
+
 export async function fetchDagLogsStream(
   dag_id: string,
   run_id: string,
