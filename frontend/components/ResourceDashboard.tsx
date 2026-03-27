@@ -56,18 +56,33 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
 
   // DAG runner
   const [dagLogs, setDagLogs] = useState<LogEntry[]>([]);
+  const [taskLogs, setTaskLogs] = useState<Record<string, LogEntry[]>>({});
+  const [taskStates, setTaskStates] = useState<Record<string, string>>({});
+  const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
   const [runningDagId, setRunningDagId] = useState<string | null>(null);
   const restoredLogsForRef = useRef<string | null>(null);
 
-  // Restore task logs from most recent run when resource/DAG data loads
+  // Restore logs/states from most recent run when resource/DAG data loads
   useEffect(() => {
     if (restoredLogsForRef.current === selectedResourceId) return;
     if (resourceDagIds.length === 0 || dagRuns.length === 0) return;
     restoredLogsForRef.current = selectedResourceId;
     const recent = dagRuns
-      .filter((r) => resourceDagIds.includes(r.dag_id) && r.task_logs?.length)
+      .filter((r) => resourceDagIds.includes(r.dag_id) && (r.task_logs?.length || r.task_sub_logs?.length))
       .sort((a, b) => b.triggered_at.localeCompare(a.triggered_at))[0];
-    setDagLogs(recent?.task_logs ?? []);
+    if (!recent) return;
+    setDagLogs(recent.task_logs ?? []);
+    if (recent.task_sub_logs) {
+      const m: Record<string, LogEntry[]> = {};
+      recent.task_sub_logs.forEach(({ task_id, logs }) => { m[task_id] = logs; });
+      setTaskLogs(m);
+    }
+    if (recent.task_final_states) {
+      const m: Record<string, string> = {};
+      recent.task_final_states.forEach(({ task_id, state }) => { m[task_id] = state; });
+      setTaskStates(m);
+      setCollapsedTasks(new Set(recent.task_final_states.map((t) => t.task_id)));
+    }
   }, [dagRuns, resourceDagIds, selectedResourceId]);
 
   // Volumetry
@@ -187,11 +202,27 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const handleTriggerDag = async (dag: DAG) => {
     setRunningDagId(dag.dag_id);
     setDagLogs([]);
+    setTaskLogs({});
+    setTaskStates({});
+    setCollapsedTasks(new Set());
     restoredLogsForRef.current = selectedResourceId; // don't overwrite with history while running
+
     const collectedLogs: LogEntry[] = [];
+    const collectedTaskLogs: Record<string, LogEntry[]> = {};
+    const collectedTaskStates: Record<string, string> = {};
+
     const addLog = (entry: LogEntry) => {
       collectedLogs.push(entry);
       setDagLogs((prev) => [...prev, entry]);
+    };
+    const addTaskLog = (taskId: string, entry: LogEntry) => {
+      if (!collectedTaskLogs[taskId]) collectedTaskLogs[taskId] = [];
+      collectedTaskLogs[taskId].push(entry);
+      setTaskLogs((prev) => ({ ...prev, [taskId]: [...(prev[taskId] ?? []), entry] }));
+    };
+    const updateStates = (tasks: Array<{ task_id: string; state: string }>) => {
+      tasks.forEach((t) => { collectedTaskStates[t.task_id] = t.state; });
+      setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
     };
 
     await triggerDagStream(
@@ -200,12 +231,13 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
       addLog,
       async (result) => {
         setRunningDagId(null);
-        // After trigger, fetch task logs for mapping issues
         if (result.run_id) {
           await fetchDagLogsStream(
             dag.dag_id,
             result.run_id,
             addLog,
+            addTaskLog,
+            updateStates,
             async (issues) => {
               if (issues.length > 0 && selectedResourceId) {
                 await saveMappingIssues(issues, selectedResourceId, result.record_id);
@@ -214,13 +246,15 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
               }
             },
             async () => {
-              await updateDagRun(result.record_id, { task_logs: collectedLogs });
+              await updateDagRun(result.record_id, {
+                task_logs: collectedLogs,
+                task_sub_logs: Object.entries(collectedTaskLogs).map(([task_id, logs]) => ({ task_id, logs })),
+                task_final_states: Object.entries(collectedTaskStates).map(([task_id, state]) => ({ task_id, state })),
+              });
             },
             () => {},
-            ["load", "update"],
           );
         }
-        // Refresh runs
         const runs = await getDagRuns();
         setDagRuns(runs);
       },
@@ -669,10 +703,44 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
             <p className="text-sm text-gray-400">No DAGs linked. Click &quot;Link DAGs&quot; to add them.</p>
           )}
 
-          {/* DAG logs */}
+          {/* DAG logs — main terminal */}
           {dagLogs.length > 0 && (
             <div className="mt-4">
               <LogPanel entries={dagLogs} running={runningDagId !== null} />
+            </div>
+          )}
+
+          {/* Per-task collapsible sub-terminals */}
+          {Object.keys(taskStates).length > 0 && (
+            <div className="mt-3 space-y-1">
+              {Object.entries(taskStates).map(([taskId, state]) => {
+                const isCollapsed = collapsedTasks.has(taskId);
+                const stateColor =
+                  state === "success" ? "bg-green-900 text-green-300" :
+                  state === "failed" ? "bg-red-900 text-red-300" :
+                  state === "running" ? "bg-blue-900 text-blue-300" :
+                  state === "upstream_failed" ? "bg-amber-900 text-amber-300" :
+                  "bg-gray-800 text-gray-400";
+                return (
+                  <div key={taskId} className="border border-gray-800 rounded-lg overflow-hidden">
+                    <button
+                      className="w-full flex items-center gap-2 px-3 py-2 bg-gray-900 hover:bg-gray-800 text-left transition-colors"
+                      onClick={() => setCollapsedTasks((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+                        return next;
+                      })}
+                    >
+                      <span className="text-gray-500 text-xs w-3">{isCollapsed ? "▶" : "▼"}</span>
+                      <span className="text-xs font-mono text-gray-200 flex-1">{taskId}</span>
+                      <span className={`text-xs px-2 py-0.5 rounded font-medium ${stateColor}`}>{state}</span>
+                    </button>
+                    {!isCollapsed && (
+                      <LogPanel entries={taskLogs[taskId] ?? []} running={state === "running"} />
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

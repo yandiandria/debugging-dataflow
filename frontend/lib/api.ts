@@ -122,6 +122,8 @@ export interface DAGRun {
   stdout?: string;
   stderr?: string;
   task_logs?: LogEntry[];
+  task_sub_logs?: Array<{ task_id: string; logs: LogEntry[] }>;
+  task_final_states?: Array<{ task_id: string; state: string }>;
 }
 
 // ── Integration Rule types ────────────────────────────────────────────────
@@ -517,15 +519,16 @@ export async function fetchDagLogsStream(
   dag_id: string,
   run_id: string,
   onLog: (entry: LogEntry) => void,
-  onMappingIssues: (issues: Array<{ unmapped_value: string; column: string }>) => void,
-  onDone: () => void,
+  onTaskLog: (taskId: string, entry: LogEntry) => void,
+  onTaskStates: (tasks: Array<{ task_id: string; state: string }>) => void,
+  onMappingIssues: (issues: Array<{ unmapped_value: string; count?: number; column: string }>) => void,
+  onDone: () => void | Promise<void>,
   onError: (message: string) => void,
-  task_ids: string[] = [],
 ): Promise<void> {
   const res = await fetch(`${BASE_URL}/api/dags/logs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dag_id, run_id, task_ids }),
+    body: JSON.stringify({ dag_id, run_id, task_ids: [] }),
   });
 
   if (!res.ok || !res.body) {
@@ -548,12 +551,17 @@ export async function fetchDagLogsStream(
       if (!line.startsWith("data: ")) continue;
       try {
         const event = JSON.parse(line.slice(6));
+        const ts = new Date().toISOString();
         if (event.type === "log") {
-          onLog({ level: event.level ?? "info", message: event.message, timestamp: new Date().toISOString() });
+          onLog({ level: event.level ?? "info", message: event.message, timestamp: ts });
+        } else if (event.type === "task_log") {
+          onTaskLog(event.task_id, { level: event.level ?? "info", message: event.message, timestamp: ts });
+        } else if (event.type === "task_states") {
+          onTaskStates(event.tasks);
         } else if (event.type === "mapping_issues") {
           onMappingIssues(event.issues);
         } else if (event.type === "done") {
-          onDone();
+          await onDone();
         } else if (event.type === "error") {
           onError(event.message);
         }
