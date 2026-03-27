@@ -11,7 +11,7 @@ import {
   getMappingIssues, saveMappingIssues, resolveMappingIssue,
   getQAExamples, createQAExample, deleteQAExample,
   getIdColumns, getColumnValues,
-  triggerDagStream, fetchDagLogsStream, fetchDagLogsRestApi, getLatestAirflowRunId,
+  triggerDagStream, fetchDagLogsRestApi,
   linkResourceDags,
   profileBlobsStream,
 } from "../lib/api";
@@ -258,29 +258,42 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
       addLog,
       async (result) => {
         setRunningDagId(null);
-        if (result.run_id) {
-          await fetchDagLogsStream(
+        if (result.run_id && airflowConfig.base_url && airflowConfig.username && airflowConfig.password) {
+          await fetchDagLogsRestApi(
+            airflowConfig,
             dag.dag_id,
-            result.run_id,
             addLog,
-            addTaskLog,
-            updateStates,
-            async (issues) => {
-              if (issues.length > 0 && selectedResourceId) {
-                await saveMappingIssues(issues, selectedResourceId, result.record_id);
-                const updated = await getMappingIssues(selectedResourceId);
-                setMappingIssues(updated);
-              }
+            (taskId: string, logs: string) => {
+              const taskEntries = logs.split("\n")
+                .filter((l) => l.trim())
+                .map((line) => ({
+                  level: "info" as const,
+                  message: line,
+                  timestamp: new Date().toISOString(),
+                }));
+              addTaskLog(taskId, taskEntries[0] ?? { level: "info", message: logs, timestamp: new Date().toISOString() });
+              if (!collectedTaskLogs[taskId]) collectedTaskLogs[taskId] = [];
+              collectedTaskLogs[taskId].push(...taskEntries);
             },
-            async () => {
+            async (taskLogs) => {
+              const states: Record<string, string> = {};
+              for (const log of taskLogs) {
+                states[log.task_id] = log.state;
+                collectedTaskStates[log.task_id] = log.state;
+              }
+              setTaskStates(states);
               await updateDagRun(result.record_id, {
                 task_logs: collectedLogs,
                 task_sub_logs: Object.entries(collectedTaskLogs).map(([task_id, logs]) => ({ task_id, logs })),
                 task_final_states: Object.entries(collectedTaskStates).map(([task_id, state]) => ({ task_id, state })),
               });
             },
-            () => {},
+            (message) => {
+              addLog({ level: "error", message, timestamp: new Date().toISOString() });
+            },
           );
+        } else if (result.run_id) {
+          addLog({ level: "warning", message: "Configure Airflow REST API to fetch logs after trigger", timestamp: new Date().toISOString() });
         }
         const runs = await getDagRuns();
         setDagRuns(runs);
@@ -299,74 +312,43 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
     restoredLogsForRef.current = selectedResourceId;
 
     try {
+      // Airflow config is now required
+      if (!airflowConfig.base_url || !airflowConfig.username || !airflowConfig.password) {
+        throw new Error("Please configure Airflow REST API connection first (click Configure button)");
+      }
+
       const addLog = (entry: LogEntry) => setDagLogs((prev) => [...prev, entry]);
 
-      // Use REST API if Airflow config is complete
-      if (airflowConfig.base_url && airflowConfig.username && airflowConfig.password) {
-        await fetchDagLogsRestApi(
-          airflowConfig,
-          dag.dag_id,
-          addLog,
-          (taskId: string, logs: string) => {
-            setTaskLogs((prev) => {
-              const taskEntries = logs.split("\n")
-                .filter((l) => l.trim())
-                .map((line) => ({
-                  level: "info" as const,
-                  message: line,
-                  timestamp: new Date().toISOString(),
-                }));
-              return { ...prev, [taskId]: taskEntries };
-            });
-          },
-          async (taskLogs) => {
-            // Update task states from the fetched logs
-            const states: Record<string, string> = {};
-            for (const log of taskLogs) {
-              states[log.task_id] = log.state;
-            }
-            setTaskStates(states);
-            const runs = await getDagRuns();
-            setDagRuns(runs);
-          },
-          (message) => {
-            setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
-          },
-        );
-      } else {
-        // Fallback to old Docker-based method
-        const airflowRunId = await getLatestAirflowRunId(dag.dag_id);
-        const localRecord = dagRuns.find((r) => r.dag_id === dag.dag_id && r.run_id === airflowRunId);
-
-        const addTaskLog = (taskId: string, entry: LogEntry) =>
-          setTaskLogs((prev) => ({ ...prev, [taskId]: [...(prev[taskId] ?? []), entry] }));
-        const updateStates = (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => {
-          setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
-          if (elapsedS !== undefined) setRunElapsedS(elapsedS);
-        };
-
-        await fetchDagLogsStream(
-          dag.dag_id,
-          airflowRunId,
-          addLog,
-          addTaskLog,
-          updateStates,
-          async (issues) => {
-            if (issues.length > 0 && selectedResourceId && localRecord) {
-              await saveMappingIssues(issues, selectedResourceId, localRecord.id);
-              const updated = await getMappingIssues(selectedResourceId);
-              setMappingIssues(updated);
-            }
-          },
-          async () => {
-            const runs = await getDagRuns();
-            setDagRuns(runs);
-          },
-          (message) => {
-            setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
-          },
-        );
-      }
+      await fetchDagLogsRestApi(
+        airflowConfig,
+        dag.dag_id,
+        addLog,
+        (taskId: string, logs: string) => {
+          setTaskLogs((prev) => {
+            const taskEntries = logs.split("\n")
+              .filter((l) => l.trim())
+              .map((line) => ({
+                level: "info" as const,
+                message: line,
+                timestamp: new Date().toISOString(),
+              }));
+            return { ...prev, [taskId]: taskEntries };
+          });
+        },
+        async (taskLogs) => {
+          // Update task states from the fetched logs
+          const states: Record<string, string> = {};
+          for (const log of taskLogs) {
+            states[log.task_id] = log.state;
+          }
+          setTaskStates(states);
+          const runs = await getDagRuns();
+          setDagRuns(runs);
+        },
+        (message) => {
+          setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
+        },
+      );
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
