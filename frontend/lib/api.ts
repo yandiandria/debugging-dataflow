@@ -480,6 +480,48 @@ export async function listAirflowDags(forceRefresh = false): Promise<AirflowDags
   };
 }
 
+// ── Docker helpers ──────────────────────────────────────────────────────────
+
+export interface DockerContainer {
+  id: string;
+  name: string;
+  image: string;
+  status: string;
+  is_airflow: boolean;
+}
+
+export async function listDockerContainers(): Promise<DockerContainer[]> {
+  const res = await fetch(`${BASE_URL}/api/docker/containers`);
+  if (!res.ok) throw new Error("Failed to list Docker containers");
+  return res.json();
+}
+
+// ── Config export / import ──────────────────────────────────────────────────
+
+export async function exportConfig(): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/config/export`);
+  if (!res.ok) throw new Error("Export failed");
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `dataflow-config-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function importConfig(file: File): Promise<{ restored: string[] }> {
+  const text = await file.text();
+  const bundle = JSON.parse(text);
+  const res = await fetch(`${BASE_URL}/api/config/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(bundle),
+  });
+  if (!res.ok) throw new Error("Import failed");
+  return res.json();
+}
+
 export async function triggerDagStream(
   dag_id: string,
   padoa_env: string,
@@ -580,10 +622,21 @@ export async function fetchDagLogsStream(
   }
 }
 
-export async function getDagRuns(dagId?: string): Promise<DAGRun[]> {
-  const url = dagId ? `${BASE_URL}/api/dag-runs?dag_id=${encodeURIComponent(dagId)}` : `${BASE_URL}/api/dag-runs`;
-  const res = await fetch(url);
+/** Fetch the run list. By default logs are stripped (fast). Pass includeLogs for full data. */
+export async function getDagRuns(dagId?: string, includeLogs = false): Promise<DAGRun[]> {
+  const params = new URLSearchParams();
+  if (dagId) params.set("dag_id", dagId);
+  if (includeLogs) params.set("include_logs", "true");
+  const qs = params.toString();
+  const res = await fetch(`${BASE_URL}/api/dag-runs${qs ? `?${qs}` : ""}`);
   if (!res.ok) throw new Error("Failed to load DAG runs");
+  return res.json();
+}
+
+/** Fetch a single run with full log data (task_logs, task_sub_logs, etc.). */
+export async function getDagRun(id: string): Promise<DAGRun> {
+  const res = await fetch(`${BASE_URL}/api/dag-runs/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error("Failed to load DAG run");
   return res.json();
 }
 

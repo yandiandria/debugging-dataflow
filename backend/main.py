@@ -83,7 +83,16 @@ _AIRFLOW_DAGS_CACHE_TTL = 300  # seconds
 
 # ── Persistence helpers ─────────────────────────────────────────────────────────
 
-DATA_DIR = Path(__file__).parent
+# DATA_DIR can be overridden via the DATAFLOW_DATA_DIR environment variable so
+# that the JSON files can live on a mounted volume (e.g. a Docker bind-mount)
+# and survive container restarts.
+#
+#   export DATAFLOW_DATA_DIR=/mnt/data/dataflow   # or docker-compose volume path
+#
+# If not set, defaults to the directory containing this file (original behaviour).
+DATA_DIR = Path(os.environ.get("DATAFLOW_DATA_DIR", "")).expanduser() if os.environ.get("DATAFLOW_DATA_DIR") else Path(__file__).parent
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 RESOURCES_FILE = DATA_DIR / "resources.json"
 DAGS_FILE = DATA_DIR / "dags.json"
 DAG_CONFIG_FILE = DATA_DIR / "dag_config.json"
@@ -449,6 +458,105 @@ async def get_resource_rules(resource_id: str):
     return [r for r in rules if resource_id in r.get("resource_ids", [])]
 
 
+# ── Docker helpers ────────────────────────────────────────────────────────────
+
+@app.get("/api/docker/containers")
+async def list_docker_containers():
+    """Return running Docker containers so the UI can offer a picker.
+
+    Each item has: id (short), name, image, status.
+    Containers whose name or image contains 'airflow' are flagged with
+    is_airflow=True so the UI can highlight them.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(status_code=504, detail="Timeout listing Docker containers")
+
+        containers = []
+        for line in stdout.decode().strip().splitlines():
+            parts = line.split("\t", 3)
+            if len(parts) < 3:
+                continue
+            cid, name, image, status = parts[0], parts[1], parts[2], parts[3] if len(parts) > 3 else ""
+            containers.append({
+                "id": cid,
+                "name": name,
+                "image": image,
+                "status": status,
+                "is_airflow": "airflow" in name.lower() or "airflow" in image.lower(),
+            })
+        return containers
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="Docker not found")
+
+
+# ── Config export / import ─────────────────────────────────────────────────────
+
+_CONFIG_FILES = {
+    "resources": RESOURCES_FILE,
+    "dags": DAGS_FILE,
+    "dag_config": DAG_CONFIG_FILE,
+    "rules": RULES_FILE,
+    "mapping_issues": MAPPING_ISSUES_FILE,
+    "qa_examples": QA_EXAMPLES_FILE,
+}
+
+
+@app.get("/api/config/export")
+async def export_config():
+    """Download all configuration as a single JSON bundle.
+
+    dag_runs are intentionally excluded (they are run history, not config).
+    """
+    bundle: Dict[str, Any] = {"exported_at": datetime.now(timezone.utc).isoformat()}
+    for key, path in _CONFIG_FILES.items():
+        try:
+            bundle[key] = json.loads(path.read_text()) if path.exists() else []
+        except Exception:
+            bundle[key] = []
+    return bundle
+
+
+class ConfigImportBody(BaseModel):
+    resources: Optional[List[Dict]] = None
+    dags: Optional[List[Dict]] = None
+    dag_config: Optional[Dict] = None
+    rules: Optional[List[Dict]] = None
+    mapping_issues: Optional[List[Dict]] = None
+    qa_examples: Optional[List[Dict]] = None
+
+
+@app.post("/api/config/import")
+async def import_config(body: ConfigImportBody):
+    """Restore configuration from an export bundle.
+
+    Only keys present in the body are written; omitted keys are left untouched.
+    dag_runs are never overwritten by an import.
+    """
+    written: List[str] = []
+    if body.resources is not None:
+        _save_json(RESOURCES_FILE, body.resources); written.append("resources")
+    if body.dags is not None:
+        _save_json(DAGS_FILE, body.dags); written.append("dags")
+    if body.dag_config is not None:
+        DAG_CONFIG_FILE.write_text(json.dumps(body.dag_config, indent=2)); written.append("dag_config")
+    if body.rules is not None:
+        _save_json(RULES_FILE, body.rules); written.append("rules")
+    if body.mapping_issues is not None:
+        _save_json(MAPPING_ISSUES_FILE, body.mapping_issues); written.append("mapping_issues")
+    if body.qa_examples is not None:
+        _save_json(QA_EXAMPLES_FILE, body.qa_examples); written.append("qa_examples")
+    return {"restored": written}
+
+
 # ── DAG endpoints ─────────────────────────────────────────────────────────────
 
 @app.get("/api/dag-config")
@@ -552,7 +660,7 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
                             run_id = match.group(1).strip(",").strip("'\"")
                             break
 
-                # Save run record
+                # Save run record, pruning old entries to cap file size
                 runs = _load_json(DAG_RUNS_FILE)
                 run_record = {
                     "id": str(uuid.uuid4()),
@@ -565,6 +673,9 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
                     "stderr": stderr_text,
                 }
                 runs.append(run_record)
+                # Keep only the most recent _MAX_DAG_RUNS entries
+                if len(runs) > _MAX_DAG_RUNS:
+                    runs = runs[-_MAX_DAG_RUNS:]
                 _save_json(DAG_RUNS_FILE, runs)
 
                 yield _log(f"DAG triggered successfully. Run ID: {run_id or 'unknown'}", "success")
@@ -776,12 +887,40 @@ async def list_airflow_dags(force_refresh: bool = False):
 
 # ── DAG run history ───────────────────────────────────────────────────────────
 
+_LOG_KEYS = {"task_logs", "task_sub_logs", "stdout", "stderr"}
+_MAX_DAG_RUNS = 200  # cap to prevent dag_runs.json from growing unbounded
+
+
+def _strip_logs(run: Dict) -> Dict:
+    """Return a copy of a run record with bulky log fields removed."""
+    return {k: v for k, v in run.items() if k not in _LOG_KEYS}
+
+
 @app.get("/api/dag-runs")
-async def list_dag_runs(dag_id: Optional[str] = None):
+async def list_dag_runs(dag_id: Optional[str] = None, include_logs: bool = False):
+    """List DAG runs.
+
+    By default log fields (task_logs, task_sub_logs, stdout, stderr) are
+    stripped from the response to keep it lightweight — the list is used for
+    status/timestamp display only.  Pass ?include_logs=true when you need
+    the full data (e.g. for restoring a previous run's log view).
+    """
     runs = _load_json(DAG_RUNS_FILE)
     if dag_id:
         runs = [r for r in runs if r.get("dag_id") == dag_id]
+    if not include_logs:
+        runs = [_strip_logs(r) for r in runs]
     return runs
+
+
+@app.get("/api/dag-runs/{run_id}")
+async def get_dag_run(run_id: str):
+    """Fetch a single DAG run with full log data."""
+    runs = _load_json(DAG_RUNS_FILE)
+    for r in runs:
+        if r["id"] == run_id:
+            return r
+    raise HTTPException(status_code=404, detail="Run not found")
 
 
 @app.patch("/api/dag-runs/{run_id}")

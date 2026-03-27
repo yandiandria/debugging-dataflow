@@ -1,6 +1,11 @@
-import { useState, useEffect, useCallback } from "react";
-import type { DAG, DAGConfig } from "../lib/api";
-import { getDags, createDag, updateDag, deleteDag, getDagConfig, updateDagConfig, listAirflowDags } from "../lib/api";
+import { useState, useEffect, useCallback, useRef } from "react";
+import type { DAG, DAGConfig, DockerContainer } from "../lib/api";
+import {
+  getDags, createDag, updateDag, deleteDag,
+  getDagConfig, updateDagConfig,
+  listAirflowDags, listDockerContainers,
+  exportConfig, importConfig,
+} from "../lib/api";
 
 function DagIdInput({
   value,
@@ -70,23 +75,48 @@ export default function DAGManager({ onBack }: Props) {
   const [showNew, setShowNew] = useState(false);
   const [newDagId, setNewDagId] = useState("");
   const [newDisplayName, setNewDisplayName] = useState("");
+
+  // Docker config editing
   const [editingConfig, setEditingConfig] = useState(false);
   const [configDraft, setConfigDraft] = useState("");
   const [configEnvsDraft, setConfigEnvsDraft] = useState("");
+  const [dockerContainers, setDockerContainers] = useState<DockerContainer[]>([]);
+  const [dockerLoading, setDockerLoading] = useState(false);
+
+  // Airflow DAG autocomplete
   const [airflowDags, setAirflowDags] = useState<string[]>([]);
   const [airflowDagsLoading, setAirflowDagsLoading] = useState(false);
   const [airflowDagsFetchedAt, setAirflowDagsFetchedAt] = useState<Date | null>(null);
   const [airflowDagsCached, setAirflowDagsCached] = useState(false);
+  const [airflowDagsError, setAirflowDagsError] = useState<string | null>(null);
+
+  // Export / import
+  const [importing, setImporting] = useState(false);
+  const [importSuccess, setImportSuccess] = useState<string | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   const fetchAirflowDags = useCallback(async (forceRefresh = false) => {
     setAirflowDagsLoading(true);
+    setAirflowDagsError(null);
     try {
       const result = await listAirflowDags(forceRefresh);
       setAirflowDags(result.dags.map((d) => d.dag_id ?? "").filter(Boolean));
       setAirflowDagsFetchedAt(new Date(result.fetched_at));
       setAirflowDagsCached(result.cached);
-    } catch { /* ignore */ } finally {
+    } catch (e: unknown) {
+      setAirflowDagsError(e instanceof Error ? e.message : "Airflow unreachable");
+    } finally {
       setAirflowDagsLoading(false);
+    }
+  }, []);
+
+  const fetchDockerContainers = useCallback(async () => {
+    setDockerLoading(true);
+    try {
+      const list = await listDockerContainers();
+      setDockerContainers(list);
+    } catch { /* ignore — Docker might not be available */ } finally {
+      setDockerLoading(false);
     }
   }, []);
 
@@ -160,6 +190,35 @@ export default function DAGManager({ onBack }: Props) {
     }
   };
 
+  const handleExport = async () => {
+    try {
+      await exportConfig();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Export failed");
+    }
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true);
+    setImportSuccess(null);
+    setError(null);
+    try {
+      const result = await importConfig(file);
+      setImportSuccess(`Restored: ${result.restored.join(", ")}`);
+      // Reload everything
+      const [d, dc] = await Promise.all([getDags(), getDagConfig()]);
+      setDags(d);
+      setConfig(dc);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Import failed");
+    } finally {
+      setImporting(false);
+      if (importInputRef.current) importInputRef.current.value = "";
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Top bar */}
@@ -174,22 +233,59 @@ export default function DAGManager({ onBack }: Props) {
             {dags.length} DAG{dags.length !== 1 ? "s" : ""}
           </span>
         </div>
-        <button
-          onClick={() => { setShowNew(true); setError(null); }}
-          className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-        >
-          + New DAG
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Export / Import */}
+          <button
+            onClick={handleExport}
+            className="text-xs text-gray-500 hover:text-gray-700 border border-gray-200 px-2 py-1.5 rounded-lg transition-colors"
+            title="Download all config as JSON backup"
+          >
+            Export config
+          </button>
+          <label
+            className={`text-xs border border-gray-200 px-2 py-1.5 rounded-lg transition-colors cursor-pointer ${importing ? "text-gray-400" : "text-gray-500 hover:text-gray-700"}`}
+            title="Restore config from a previously exported JSON file"
+          >
+            {importing ? "Importing…" : "Import config"}
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={handleImport}
+              disabled={importing}
+            />
+          </label>
+          <button
+            onClick={() => { setShowNew(true); setError(null); }}
+            className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg transition-colors"
+          >
+            + New DAG
+          </button>
+        </div>
       </div>
 
       <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
+
+        {importSuccess && (
+          <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-3 text-sm text-green-700 flex items-center justify-between">
+            <span>{importSuccess}</span>
+            <button onClick={() => setImportSuccess(null)} className="text-green-500 hover:text-green-700 ml-4">×</button>
+          </div>
+        )}
+
         {/* Docker config */}
         <div className="bg-white border border-gray-200 rounded-xl p-4">
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-sm font-semibold text-gray-700">Docker Configuration</h3>
             {!editingConfig && (
               <button
-                onClick={() => { setEditingConfig(true); setConfigDraft(config.container_name); setConfigEnvsDraft(config.environments.join(", ")); }}
+                onClick={() => {
+                  setEditingConfig(true);
+                  setConfigDraft(config.container_name);
+                  setConfigEnvsDraft(config.environments.join(", "));
+                  fetchDockerContainers();
+                }}
                 className="text-xs text-indigo-600 hover:text-indigo-800"
               >
                 Edit
@@ -207,6 +303,44 @@ export default function DAGManager({ onBack }: Props) {
                   placeholder="e.g. airflow-worker"
                   className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400"
                 />
+
+                {/* Running container picker */}
+                <div className="mt-2">
+                  {dockerLoading ? (
+                    <p className="text-xs text-gray-400 animate-pulse">Detecting running containers…</p>
+                  ) : dockerContainers.length > 0 ? (
+                    <div>
+                      <p className="text-xs text-gray-400 mb-1">
+                        Running containers — click to select:
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {dockerContainers.map((c) => (
+                          <button
+                            key={c.id}
+                            onClick={() => setConfigDraft(c.name)}
+                            className={`text-xs font-mono px-2 py-1 rounded border transition-colors ${
+                              c.name === configDraft
+                                ? "bg-indigo-600 text-white border-indigo-600"
+                                : c.is_airflow
+                                ? "bg-amber-50 border-amber-300 text-amber-800 hover:bg-amber-100"
+                                : "bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100"
+                            }`}
+                            title={`${c.image} — ${c.status}`}
+                          >
+                            {c.is_airflow && <span className="mr-1">✦</span>}
+                            {c.name}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-xs text-gray-400 mt-1">✦ = likely Airflow container</p>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-400">
+                      No running containers detected.{" "}
+                      <button onClick={fetchDockerContainers} className="underline hover:text-gray-600">Retry</button>
+                    </p>
+                  )}
+                </div>
               </div>
               <div>
                 <label className="block text-xs text-gray-500 mb-1">Environments (comma-separated)</label>
@@ -226,7 +360,10 @@ export default function DAGManager({ onBack }: Props) {
           ) : (
             <div className="text-sm space-y-1">
               <p className="text-gray-600">
-                Container: <span className="font-mono text-gray-800">{config.container_name || "(not set)"}</span>
+                Container:{" "}
+                {config.container_name
+                  ? <span className="font-mono text-gray-800">{config.container_name}</span>
+                  : <span className="font-mono text-amber-600">(not set — click Edit to pick a container)</span>}
               </p>
               <p className="text-gray-600">
                 Environments: {config.environments.map((e) => (
@@ -235,6 +372,9 @@ export default function DAGManager({ onBack }: Props) {
               </p>
               <p className="text-xs text-gray-400 mt-2">
                 Trigger: <code className="bg-gray-100 px-1 rounded">docker exec {config.container_name || "<container>"} airflow dags trigger {"<dag_id>"} --conf {`'{"padoa_env": "<env>"}'`}</code>
+              </p>
+              <p className="text-xs text-gray-400 mt-1">
+                Config is persisted on the server. Use <strong>Export config</strong> to back it up as a JSON file you can re-import after a reset.
               </p>
             </div>
           )}
@@ -253,25 +393,23 @@ export default function DAGManager({ onBack }: Props) {
             <div className="flex items-center gap-2">
               <span>Airflow DAG ID</span>
               {/* Autocomplete source status */}
-              <span className="font-normal text-gray-400">
+              <span className="font-normal">
                 {airflowDagsLoading ? (
-                  <span className="animate-pulse">fetching suggestions…</span>
+                  <span className="text-gray-400 animate-pulse">fetching suggestions…</span>
+                ) : airflowDagsError ? (
+                  <span className="text-amber-500">
+                    container unreachable ·{" "}
+                    <button onClick={() => fetchAirflowDags(true)} className="underline hover:text-amber-700">retry</button>
+                    {" · "}type DAG ID manually
+                  </span>
                 ) : airflowDagsFetchedAt ? (
-                  <>
+                  <span className="text-gray-400">
                     {airflowDagsCached ? "cached · " : ""}
                     {airflowDags.length} suggestions ·{" "}
-                    <button
-                      onClick={() => fetchAirflowDags(true)}
-                      className="underline hover:text-indigo-600"
-                    >
-                      refresh
-                    </button>
-                  </>
+                    <button onClick={() => fetchAirflowDags(true)} className="underline hover:text-indigo-600">refresh</button>
+                  </span>
                 ) : (
-                  <button
-                    onClick={() => fetchAirflowDags(true)}
-                    className="underline hover:text-indigo-600"
-                  >
+                  <button onClick={() => fetchAirflowDags(true)} className="text-gray-400 underline hover:text-indigo-600">
                     load suggestions
                   </button>
                 )}
