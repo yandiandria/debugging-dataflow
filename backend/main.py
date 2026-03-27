@@ -191,6 +191,7 @@ class Resource(BaseModel):
     business_name: str
     created_at: str
     extract_prefixes: List[str] = []
+    dag_ids: List[str] = []
 
 
 class ResourceCreate(BaseModel):
@@ -583,60 +584,101 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
     if not container:
         raise HTTPException(status_code=400, detail="Docker container name not configured.")
 
-    task_ids = body.task_ids if body.task_ids else [None]  # None = no task filter
+    _TERMINAL_STATES = {"success", "failed", "upstream_failed", "skipped"}
 
     async def generate() -> AsyncGenerator[str, None]:
-        yield _log(f"Fetching logs for DAG {body.dag_id}, run {body.run_id}...")
+        yield _log(f"Polling tasks for DAG {body.dag_id}, run {body.run_id}…")
 
-        all_logs = ""
-        all_mapping_issues: List[Dict[str, str]] = []
+        fetched_tasks: set = set()
+        last_states: Dict[str, str] = {}
+        all_mapping_issues: List[Dict] = []
+        all_task_logs: str = ""
 
         try:
-            for task_id in task_ids:
-                if task_id:
-                    script = (
-                        f"find /opt/airflow/logs/ -type f -name '*.log'"
-                        f" -path '*{body.dag_id}*' -path '*{task_id}*'"
-                        f" 2>/dev/null | sort | xargs cat 2>/dev/null"
-                    )
-                else:
-                    script = (
-                        f"find /opt/airflow/logs/ -type f -name '*.log'"
-                        f" -path '*{body.dag_id}*'"
-                        f" 2>/dev/null | sort | xargs cat 2>/dev/null"
-                    )
-                cmd = ["docker", "exec", container, "bash", "-c", script]
-
-                if task_id:
-                    yield _log(f"── task: {task_id} ──", "info")
-
+            for _ in range(300):  # max 10 min at 2s intervals
+                # ── poll task states ──────────────────────────────────────
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd,
+                    "docker", "exec", container,
+                    "airflow", "tasks", "states-for-dag-run",
+                    body.dag_id, body.run_id, "--output", "json",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                stdout, stderr = await proc.communicate()
-                stdout_text = stdout.decode() if stdout else ""
-                stderr_text = stderr.decode() if stderr else ""
+                stdout, _ = await proc.communicate()
 
-                if stdout_text:
-                    for line in stdout_text.strip().split("\n"):
-                        yield _log(line, "info")
-                if stderr_text:
-                    for line in stderr_text.strip().split("\n"):
-                        yield _log(line, "warning")
+                # Extract the JSON array line (strips Airflow startup warnings)
+                tasks: List[Dict] = []
+                for line in stdout.decode().strip().split("\n"):
+                    stripped = line.strip()
+                    if stripped.startswith("["):
+                        try:
+                            parsed = json.loads(stripped)
+                            if isinstance(parsed, list):
+                                tasks = parsed
+                                break
+                        except json.JSONDecodeError:
+                            pass
 
-                all_logs += stdout_text + "\n" + stderr_text + "\n"
+                if not tasks:
+                    await asyncio.sleep(2)
+                    continue
 
-                # Parse mapping issues from this task's logs
-                issues = _parse_mapping_issues(stdout_text + "\n" + stderr_text)
-                all_mapping_issues.extend(issues)
+                # Emit live state snapshot for the status bar
+                yield _sse({
+                    "type": "task_states",
+                    "tasks": [{"task_id": t.get("task_id", ""), "state": t.get("state", "")} for t in tasks],
+                })
+
+                # Log state changes to the main terminal
+                for task in tasks:
+                    tid, state = task.get("task_id", ""), task.get("state", "")
+                    if last_states.get(tid) != state:
+                        last_states[tid] = state
+                        yield _log(f"{tid}: {state}", "info")
+
+                # ── fetch logs for newly-terminal tasks ───────────────────
+                for task in tasks:
+                    tid, state = task.get("task_id", ""), task.get("state", "")
+                    if state in _TERMINAL_STATES and tid and tid not in fetched_tasks:
+                        fetched_tasks.add(tid)
+                        yield _log(f"Fetching logs: {tid} ({state})", "info")
+
+                        script = (
+                            f"LOGDIR=$(airflow config get-value logging base_log_folder 2>/dev/null || echo '/opt/airflow/logs');"
+                            f" find \"$LOGDIR\" -type f -path '*{body.dag_id}*' -path '*{tid}*'"
+                            f" 2>/dev/null | sort | xargs cat 2>/dev/null"
+                        )
+                        log_proc = await asyncio.create_subprocess_exec(
+                            "docker", "exec", container, "bash", "-c", script,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        log_stdout, log_stderr = await log_proc.communicate()
+                        log_text = log_stdout.decode() if log_stdout else ""
+                        err_text = log_stderr.decode() if log_stderr else ""
+
+                        for line in log_text.strip().split("\n"):
+                            if line and not _is_airflow_noise(line):
+                                yield _sse({"type": "task_log", "task_id": tid, "level": "info", "message": line})
+                        for line in err_text.strip().split("\n"):
+                            if line and not _is_airflow_noise(line):
+                                yield _sse({"type": "task_log", "task_id": tid, "level": "warning", "message": line})
+
+                        combined = log_text + "\n" + err_text
+                        all_task_logs += combined
+                        all_mapping_issues.extend(_parse_mapping_issues(combined))
+
+                # ── done when all tasks are terminal ─────────────────────
+                if all(t.get("state") in _TERMINAL_STATES for t in tasks):
+                    break
+
+                await asyncio.sleep(2)
 
             if all_mapping_issues:
-                yield _log(f"Found {len(all_mapping_issues)} mapping issue(s) in logs", "warning")
+                yield _log(f"Found {len(all_mapping_issues)} mapping issue(s)", "warning")
                 yield _sse({"type": "mapping_issues", "issues": all_mapping_issues})
 
-            yield _sse({"type": "done", "logs": all_logs})
+            yield _sse({"type": "done", "logs": all_task_logs})
 
         except Exception as e:
             yield _sse({"type": "error", "message": str(e)})
@@ -681,7 +723,28 @@ async def list_dag_runs(dag_id: Optional[str] = None):
     return runs
 
 
+@app.patch("/api/dag-runs/{run_id}")
+async def update_dag_run(run_id: str, body: Dict):
+    runs = _load_json(DAG_RUNS_FILE)
+    for r in runs:
+        if r["id"] == run_id:
+            r.update(body)
+            _save_json(DAG_RUNS_FILE, runs)
+            return r
+    raise HTTPException(status_code=404, detail="Run not found")
+
+
 # ── Mapping issue parsing & endpoints ─────────────────────────────────────────
+
+_AIRFLOW_NOISE_SUBSTRINGS = [
+    "Could not import graphviz",
+    "Rendering graph to the graphical format will not be possible",
+]
+
+
+def _is_airflow_noise(line: str) -> bool:
+    return any(s in line for s in _AIRFLOW_NOISE_SUBSTRINGS)
+
 
 def _parse_mapping_issues(log_text: str) -> List[Dict]:
     """Parse mapping issue lines from Airflow logs.
