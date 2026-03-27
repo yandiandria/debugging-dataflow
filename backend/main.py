@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -12,7 +13,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
+import httpx
 import pandas as pd
 import polars as pl
 from azure.core.exceptions import AzureError
@@ -297,10 +300,11 @@ class DAGRunRequest(BaseModel):
     padoa_env: str
 
 
-class DAGLogRequest(BaseModel):
-    dag_id: str
-    run_id: str
-    task_ids: List[str] = []
+class AirflowRestAPIConfig(BaseModel):
+    base_url: str
+    username: str
+    password: str
+    verify_tls: bool = True
 
 
 class NotionConfigUpdate(BaseModel):
@@ -702,131 +706,226 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
     )
 
 
-@app.post("/api/dags/logs")
-async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
-    config = _load_dag_config()
-    container = config.get("container_name", "")
-    if not container:
-        raise HTTPException(status_code=400, detail="Docker container name not configured.")
+@app.post("/api/dags/logs-rest-api")
+async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse:
+    """Fetch Airflow logs using the REST API instead of Docker/filesystem.
 
-    _TERMINAL_STATES = {"success", "failed", "upstream_failed", "skipped"}
+    This implementation follows the Airflow REST API contract:
+    1. Get the latest DAG run via /api/v1/dags/{dag_id}/dagRuns
+    2. List all task instances with pagination via /api/v1/dags/{dag_id}/dagRuns/{run_id}/taskInstances
+    3. Fetch logs for each task via /api/v1/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}
 
-    async def _fetch_task_log(tid: str) -> Tuple[str, str]:
-        """Fetch Airflow logs for a single task. Returns (log_text, err_text)."""
-        script = (
-            f"LOGDIR=$(airflow config get-value logging base_log_folder 2>/dev/null || echo '/opt/airflow/logs');"
-            f" find \"$LOGDIR\" -type f -path '*{body.dag_id}*' -path '*{tid}*'"
-            f" 2>/dev/null | sort | xargs cat 2>/dev/null"
-        )
-        log_proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", container, "bash", "-c", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        log_stdout, log_stderr = await log_proc.communicate()
-        return (
-            log_stdout.decode() if log_stdout else "",
-            log_stderr.decode() if log_stderr else "",
-        )
+    Handles:
+    - Mapped task instances (using map_index)
+    - Pagination of task instances
+    - Proper URL encoding of dag_id, run_id, and task_id
+    - Latest attempt (try_number) per task instance
+    - Plain text logs (not JSON)
+    """
 
     async def generate() -> AsyncGenerator[str, None]:
-        yield _log(f"Polling tasks for DAG {body.dag_id}, run {body.run_id}…")
-
-        fetched_tasks: set = set()
-        last_states: Dict[str, str] = {}
-        all_mapping_issues: List[Dict] = []
-        all_task_logs: str = ""
-        poll_start = time.monotonic()
-
         try:
-            for _ in range(300):  # max 10 min at 2s intervals
-                elapsed_s = round(time.monotonic() - poll_start)
+            # Build authorization header
+            credentials = f"{body.username}:{body.password}"
+            encoded_credentials = base64.b64encode(credentials.encode()).decode()
+            auth_header = f"Basic {encoded_credentials}"
 
-                # ── poll task states ──────────────────────────────────────
-                proc = await asyncio.create_subprocess_exec(
-                    "docker", "exec", container,
-                    "airflow", "tasks", "states-for-dag-run",
-                    body.dag_id, body.run_id, "--output", "json",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
+            # Strip trailing slash from base_url if present
+            base_url = body.base_url.rstrip("/")
 
-                # Extract the JSON array line (strips Airflow startup warnings)
-                tasks: List[Dict] = []
-                for line in stdout.decode().strip().split("\n"):
-                    stripped = line.strip()
-                    if stripped.startswith("["):
-                        try:
-                            parsed = json.loads(stripped)
-                            if isinstance(parsed, list):
-                                tasks = parsed
-                                break
-                        except json.JSONDecodeError:
-                            pass
+            async with httpx.AsyncClient(verify=body.verify_tls, timeout=30.0) as client:
+                # Step 0: Verify health/connectivity
+                yield _log("Verifying Airflow connectivity...", "info")
+                try:
+                    health_resp = await client.get(
+                        f"{base_url}/api/v1/health",
+                        headers={"Authorization": auth_header}
+                    )
+                    if health_resp.status_code == 401:
+                        yield _log("Authentication failed (401). Check username/password.", "error")
+                        return
+                    if health_resp.status_code == 403:
+                        yield _log("Access forbidden (403). Check permissions.", "error")
+                        return
+                    if health_resp.status_code != 200:
+                        yield _log(f"Health check failed with status {health_resp.status_code}", "warning")
+                except Exception as e:
+                    yield _log(f"Failed to connect to Airflow at {base_url}: {e}", "error")
+                    return
 
-                if not tasks:
-                    await asyncio.sleep(2)
-                    continue
+                yield _log("Connected to Airflow successfully", "success")
 
-                # Emit live state snapshot (with elapsed time for the UI timer)
+                # Step 1: Get the latest DAG run
+                yield _log("Fetching latest DAG run...", "info")
+                dag_id_encoded = quote(body.dag_id, safe="")
+
+                try:
+                    runs_resp = await client.get(
+                        f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns",
+                        params={"limit": "1", "order_by": "-execution_date"},
+                        headers={"Authorization": auth_header}
+                    )
+                    runs_resp.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        yield _log(f"DAG '{body.dag_id}' not found", "error")
+                    else:
+                        yield _log(f"Failed to fetch DAG runs: {e.response.status_code}", "error")
+                    return
+                except Exception as e:
+                    yield _log(f"Error fetching DAG runs: {e}", "error")
+                    return
+
+                runs_data = runs_resp.json()
+                dag_runs = runs_data.get("dag_runs", [])
+
+                if not dag_runs:
+                    yield _log(f"No runs found for DAG '{body.dag_id}'", "warning")
+                    return
+
+                run_id = dag_runs[0].get("dag_run_id")
+                yield _log(f"Found latest run: {run_id}", "success")
+
+                # Step 2: List all task instances (with pagination)
+                yield _log("Fetching all task instances...", "info")
+
+                run_id_encoded = quote(run_id, safe="")
+                all_task_instances = []
+                offset = 0
+                page_size = 100
+                page_num = 0
+
+                while True:
+                    page_num += 1
+                    try:
+                        ti_resp = await client.get(
+                            f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns/{run_id_encoded}/taskInstances",
+                            params={"limit": str(page_size), "offset": str(offset)},
+                            headers={"Authorization": auth_header}
+                        )
+                        ti_resp.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        yield _log(f"Failed to fetch task instances: {e.response.status_code}", "error")
+                        return
+                    except Exception as e:
+                        yield _log(f"Error fetching task instances: {e}", "error")
+                        return
+
+                    ti_data = ti_resp.json()
+                    task_instances = ti_data.get("task_instances", [])
+
+                    if not task_instances:
+                        break
+
+                    all_task_instances.extend(task_instances)
+                    yield _log(f"Page {page_num}: Fetched {len(task_instances)} task instances", "info")
+
+                    if len(task_instances) < page_size:
+                        break
+
+                    offset += page_size
+
+                yield _log(f"Total task instances: {len(all_task_instances)}", "success")
+
+                # Step 3: Fetch logs for each task instance
+                yield _log(f"Fetching logs for {len(all_task_instances)} task instance(s)...", "info")
+
+                all_logs: List[Dict[str, Any]] = []
+
+                for idx, ti in enumerate(all_task_instances, 1):
+                    task_id = ti.get("task_id", "")
+                    try_number = ti.get("try_number", 1)
+                    map_index = ti.get("map_index", -1)
+                    state = ti.get("state", "unknown")
+
+                    task_id_encoded = quote(task_id, safe="")
+
+                    # Build log URL
+                    log_url = (
+                        f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns/{run_id_encoded}/"
+                        f"taskInstances/{task_id_encoded}/logs/{try_number}"
+                    )
+
+                    # Add map_index if this is a mapped task
+                    params = {}
+                    if map_index >= 0:
+                        params["map_index"] = str(map_index)
+
+                    try:
+                        log_resp = await client.get(
+                            log_url,
+                            params=params,
+                            headers={"Authorization": auth_header}
+                        )
+
+                        # 404 can mean no logs yet, task never ran, or wrong map_index/try_number
+                        if log_resp.status_code == 404:
+                            yield _log(
+                                f"[{idx}/{len(all_task_instances)}] {task_id}"
+                                f"(map_index={map_index}, try={try_number}): No logs (404)",
+                                "warning"
+                            )
+                            all_logs.append({
+                                "task_id": task_id,
+                                "map_index": map_index,
+                                "try_number": try_number,
+                                "state": state,
+                                "logs": "",
+                                "status": "not_found"
+                            })
+                        elif log_resp.status_code == 200:
+                            # Logs endpoint returns plain text, not JSON
+                            log_text = log_resp.text
+                            yield _log(
+                                f"[{idx}/{len(all_task_instances)}] {task_id}"
+                                f"(map_index={map_index}, try={try_number}, state={state}): "
+                                f"{len(log_text)} bytes",
+                                "success"
+                            )
+                            all_logs.append({
+                                "task_id": task_id,
+                                "map_index": map_index,
+                                "try_number": try_number,
+                                "state": state,
+                                "logs": log_text,
+                                "status": "success"
+                            })
+                        else:
+                            yield _log(
+                                f"[{idx}/{len(all_task_instances)}] {task_id}"
+                                f"(map_index={map_index}, try={try_number}): HTTP {log_resp.status_code}",
+                                "warning"
+                            )
+                            all_logs.append({
+                                "task_id": task_id,
+                                "map_index": map_index,
+                                "try_number": try_number,
+                                "state": state,
+                                "logs": "",
+                                "status": f"error_{log_resp.status_code}"
+                            })
+                    except Exception as e:
+                        yield _log(
+                            f"[{idx}/{len(all_task_instances)}] {task_id}: Exception: {e}",
+                            "error"
+                        )
+                        all_logs.append({
+                            "task_id": task_id,
+                            "map_index": map_index,
+                            "try_number": try_number,
+                            "state": state,
+                            "logs": "",
+                            "status": "exception"
+                        })
+
+                yield _log(f"Log fetching complete", "success")
                 yield _sse({
-                    "type": "task_states",
-                    "tasks": [{"task_id": t.get("task_id", ""), "state": t.get("state", "")} for t in tasks],
-                    "elapsed_s": elapsed_s,
+                    "type": "done",
+                    "dag_id": body.dag_id,
+                    "run_id": run_id,
+                    "task_count": len(all_task_instances),
+                    "logs": all_logs
                 })
-
-                # Log state changes to the main terminal
-                for task in tasks:
-                    tid, state = task.get("task_id", ""), task.get("state", "")
-                    if last_states.get(tid) != state:
-                        last_states[tid] = state
-                        yield _log(f"{tid}: {state}", "info")
-
-                # ── fetch logs for newly-terminal tasks (in parallel) ─────
-                new_terminal = [
-                    (t.get("task_id", ""), t.get("state", ""))
-                    for t in tasks
-                    if t.get("state") in _TERMINAL_STATES
-                    and t.get("task_id")
-                    and t.get("task_id") not in fetched_tasks
-                ]
-                if new_terminal:
-                    for tid, _ in new_terminal:
-                        fetched_tasks.add(tid)
-                    yield _log(
-                        f"Fetching logs for {len(new_terminal)} task(s) in parallel: "
-                        + ", ".join(tid for tid, _ in new_terminal),
-                        "info",
-                    )
-
-                    log_results: List[Tuple[str, str]] = await asyncio.gather(
-                        *[_fetch_task_log(tid) for tid, _ in new_terminal]
-                    )
-
-                    for (tid, state), (log_text, err_text) in zip(new_terminal, log_results):
-                        for line in log_text.strip().split("\n"):
-                            if line and not _is_airflow_noise(line):
-                                yield _sse({"type": "task_log", "task_id": tid, "level": "info", "message": line})
-                        for line in err_text.strip().split("\n"):
-                            if line and not _is_airflow_noise(line):
-                                yield _sse({"type": "task_log", "task_id": tid, "level": "warning", "message": line})
-
-                        combined = log_text + "\n" + err_text
-                        all_task_logs += combined
-                        all_mapping_issues.extend(_parse_mapping_issues(combined))
-
-                # ── done when all tasks are terminal ─────────────────────
-                if all(t.get("state") in _TERMINAL_STATES for t in tasks):
-                    break
-
-                await asyncio.sleep(2)
-
-            if all_mapping_issues:
-                yield _log(f"Found {len(all_mapping_issues)} mapping issue(s)", "warning")
-                yield _sse({"type": "mapping_issues", "issues": all_mapping_issues})
-
-            yield _sse({"type": "done", "logs": all_task_logs})
 
         except Exception as e:
             yield _sse({"type": "error", "message": str(e)})
