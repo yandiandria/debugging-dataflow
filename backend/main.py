@@ -683,23 +683,19 @@ async def list_dag_runs(dag_id: Optional[str] = None):
 
 # ── Mapping issue parsing & endpoints ─────────────────────────────────────────
 
-def _parse_mapping_issues(log_text: str) -> List[Dict[str, str]]:
+def _parse_mapping_issues(log_text: str) -> List[Dict]:
     """Parse mapping issue lines from Airflow logs.
-    Expected format: WARNING - Unmapped value 'X' for column 'Y'
-    Adjust the regex pattern to match your actual log format.
+    Expected format:
+    {map_and_log.py:NNN} WARNING - Les valeurs (...) (COUNT) ne sont pas présentes dans le mapping NAME.
     """
     issues = []
-    # Pattern: adjust to match your actual Airflow log format
-    patterns = [
-        r"(?:WARNING|WARN)\s*[-:]\s*[Uu]nmapped\s+value\s+['\"]([^'\"]+)['\"]\s+(?:for|in)\s+column\s+['\"]([^'\"]+)['\"]",
-        r"(?:WARNING|WARN)\s*[-:]\s*[Mm]apping\s+not\s+found\s+(?:for\s+)?['\"]([^'\"]+)['\"]\s+(?:in|for)\s+['\"]([^'\"]+)['\"]",
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, log_text):
-            issues.append({
-                "unmapped_value": match.group(1),
-                "column": match.group(2),
-            })
+    pattern = r"\} WARNING - Les valeurs (\(.+?\)) \((\d+)\) ne sont pas présentes dans le mapping (.+?)\."
+    for match in re.finditer(pattern, log_text):
+        issues.append({
+            "unmapped_value": match.group(1),
+            "count": int(match.group(2)),
+            "column": match.group(3),
+        })
     return issues
 
 
@@ -728,7 +724,7 @@ async def save_mapping_issues(issues: List[Dict], resource_id: str, dag_run_id: 
         if pair not in new_pairs and not ex.get("fixed_in_rerun"):
             ex["fixed_in_rerun"] = now[:10]  # date only
 
-    # Add new issues that don't already exist
+    # Add new issues that don't already exist; update count if they reappear
     existing_pairs = {(e["unmapped_value"], e["column"]) for e in existing if e.get("resource_id") == resource_id}
     for issue in issues:
         pair = (issue["unmapped_value"], issue["column"])
@@ -738,16 +734,18 @@ async def save_mapping_issues(issues: List[Dict], resource_id: str, dag_run_id: 
                 "resource_id": resource_id,
                 "dag_run_id": dag_run_id,
                 "unmapped_value": issue["unmapped_value"],
+                "count": issue.get("count"),
                 "column": issue["column"],
                 "first_seen": now,
                 "fixed_in_rerun": None,
                 "resolved": False,
             })
         else:
-            # Re-appeared: clear fixed_in_rerun tag
+            # Re-appeared: clear fixed_in_rerun tag and refresh count
             for ex in existing:
                 if ex.get("resource_id") == resource_id and ex["unmapped_value"] == issue["unmapped_value"] and ex["column"] == issue["column"]:
                     ex["fixed_in_rerun"] = None
+                    ex["count"] = issue.get("count")
 
     _save_json(MAPPING_ISSUES_FILE, existing)
     return [i for i in existing if i.get("resource_id") == resource_id]

@@ -399,8 +399,13 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                       <div key={issue.id} className="flex items-center justify-between py-1 pl-3">
                         <div className="flex items-center gap-2">
                           <span className={`text-sm ${issue.resolved ? "text-gray-400 line-through" : "text-gray-800"}`}>
-                            &quot;{issue.unmapped_value}&quot;
+                            {issue.unmapped_value}
                           </span>
+                          {issue.count != null && (
+                            <span className="text-xs bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded">
+                              {issue.count}×
+                            </span>
+                          )}
                           <span className="text-xs text-gray-400">
                             (since {new Date(issue.first_seen).toLocaleDateString()})
                           </span>

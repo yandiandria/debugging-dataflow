@@ -140,6 +140,7 @@ export interface MappingIssue {
   resource_id: string;
   dag_run_id: string;
   unmapped_value: string;
+  count?: number;
   column: string;
   first_seen: string;
   fixed_in_rerun: string | null;
