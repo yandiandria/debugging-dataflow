@@ -11,7 +11,7 @@ import {
   getMappingIssues, saveMappingIssues, resolveMappingIssue,
   getQAExamples, createQAExample, deleteQAExample,
   getIdColumns, getColumnValues,
-  triggerDagStream, fetchDagLogsStream,
+  triggerDagStream, fetchDagLogsStream, getLatestAirflowRunId,
   linkResourceDags,
   profileBlobsStream,
 } from "../lib/api";
@@ -60,6 +60,7 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const [taskStates, setTaskStates] = useState<Record<string, string>>({});
   const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
   const [runningDagId, setRunningDagId] = useState<string | null>(null);
+  const [loadingLogsForDagId, setLoadingLogsForDagId] = useState<string | null>(null);
   const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
 
@@ -279,6 +280,56 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
       },
       () => setRunningDagId(null),
     );
+  };
+
+  const handleLoadLastRun = async (dag: DAG) => {
+    setLoadingLogsForDagId(dag.dag_id);
+    setRunElapsedS(0);
+    setDagLogs([]);
+    setTaskLogs({});
+    setTaskStates({});
+    setCollapsedTasks(new Set());
+    restoredLogsForRef.current = selectedResourceId;
+
+    try {
+      const airflowRunId = await getLatestAirflowRunId(dag.dag_id);
+      const localRecord = dagRuns.find((r) => r.dag_id === dag.dag_id && r.run_id === airflowRunId);
+
+      const addLog = (entry: LogEntry) => setDagLogs((prev) => [...prev, entry]);
+      const addTaskLog = (taskId: string, entry: LogEntry) =>
+        setTaskLogs((prev) => ({ ...prev, [taskId]: [...(prev[taskId] ?? []), entry] }));
+      const updateStates = (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => {
+        setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
+        if (elapsedS !== undefined) setRunElapsedS(elapsedS);
+      };
+
+      await fetchDagLogsStream(
+        dag.dag_id,
+        airflowRunId,
+        addLog,
+        addTaskLog,
+        updateStates,
+        async (issues) => {
+          if (issues.length > 0 && selectedResourceId && localRecord) {
+            await saveMappingIssues(issues, selectedResourceId, localRecord.id);
+            const updated = await getMappingIssues(selectedResourceId);
+            setMappingIssues(updated);
+          }
+        },
+        async () => {
+          const runs = await getDagRuns();
+          setDagRuns(runs);
+        },
+        (message) => {
+          setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
+        },
+      );
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
+    } finally {
+      setLoadingLogsForDagId(null);
+    }
   };
 
   const getLastRun = (dagId: string): DAGRun | undefined => {
@@ -697,6 +748,8 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
               {linkedDags.map((dag, idx) => {
                 const lastRun = getLastRun(dag.dag_id);
                 const isRunning = runningDagId === dag.dag_id;
+                const isLoadingLogs = loadingLogsForDagId === dag.dag_id;
+                const isBusy = isRunning || isLoadingLogs || runningDagId !== null || loadingLogsForDagId !== null;
 
                 return (
                   <div key={dag.id} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
@@ -714,8 +767,15 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                       )}
                       {!lastRun && <span className="text-xs text-gray-400">not run yet</span>}
                       <button
+                        onClick={() => handleLoadLastRun(dag)}
+                        disabled={isBusy}
+                        className="text-xs bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
+                      >
+                        {isLoadingLogs ? "Loading..." : "Load last run"}
+                      </button>
+                      <button
                         onClick={() => handleTriggerDag(dag)}
-                        disabled={isRunning || runningDagId !== null}
+                        disabled={isBusy}
                         className="text-xs bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
                       >
                         {isRunning ? "Running..." : "Run"}

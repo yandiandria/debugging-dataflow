@@ -939,6 +939,45 @@ async def update_dag_run(run_id: str, body: Dict):
     raise HTTPException(status_code=404, detail="Run not found")
 
 
+@app.get("/api/dags/{dag_id}/latest-run-id")
+async def get_latest_airflow_run_id(dag_id: str):
+    """Return the most recent run_id for dag_id by querying Airflow directly."""
+    config = _load_dag_config()
+    container = config.get("container_name", "")
+    if not container:
+        raise HTTPException(status_code=400, detail="Docker container name not configured.")
+
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", container,
+        "airflow", "dags", "list-runs", "-d", dag_id, "--output", "json",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+
+    runs: List[Dict] = []
+    for line in stdout.decode().strip().split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    runs = parsed
+                    break
+            except json.JSONDecodeError:
+                pass
+
+    if not runs:
+        raise HTTPException(status_code=404, detail="No runs found for this DAG.")
+
+    latest = sorted(runs, key=lambda r: r.get("execution_date", ""), reverse=True)[0]
+    run_id = latest.get("run_id", "")
+    if not run_id:
+        raise HTTPException(status_code=404, detail="Could not determine run_id.")
+
+    return {"run_id": run_id}
+
+
 # ── Mapping issue parsing & endpoints ─────────────────────────────────────────
 
 _AIRFLOW_NOISE_SUBSTRINGS = [
