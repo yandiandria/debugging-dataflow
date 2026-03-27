@@ -60,6 +60,7 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const [taskStates, setTaskStates] = useState<Record<string, string>>({});
   const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
   const [runningDagId, setRunningDagId] = useState<string | null>(null);
+  const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
 
   // Restore logs/states from most recent run when resource/DAG data loads
@@ -201,6 +202,7 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
 
   const handleTriggerDag = async (dag: DAG) => {
     setRunningDagId(dag.dag_id);
+    setRunElapsedS(0);
     setDagLogs([]);
     setTaskLogs({});
     setTaskStates({});
@@ -220,9 +222,10 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
       collectedTaskLogs[taskId].push(entry);
       setTaskLogs((prev) => ({ ...prev, [taskId]: [...(prev[taskId] ?? []), entry] }));
     };
-    const updateStates = (tasks: Array<{ task_id: string; state: string }>) => {
+    const updateStates = (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => {
       tasks.forEach((t) => { collectedTaskStates[t.task_id] = t.state; });
       setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
+      if (elapsedS !== undefined) setRunElapsedS(elapsedS);
     };
 
     await triggerDagStream(
@@ -631,6 +634,13 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
             <h3 className="text-sm font-semibold text-gray-700">
               DAG Runner
               <span className="ml-2 text-xs text-gray-400 font-normal">padoa_env: {selectedEnv}</span>
+              {runningDagId !== null && (
+                <span className="ml-3 text-xs font-mono text-blue-500 animate-pulse">
+                  {Math.floor(runElapsedS / 60) > 0
+                    ? `${Math.floor(runElapsedS / 60)}m ${runElapsedS % 60}s`
+                    : `${runElapsedS}s`}
+                </span>
+              )}
             </h3>
             <div className="relative">
               <button

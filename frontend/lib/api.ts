@@ -458,16 +458,26 @@ export async function updateDagConfig(config: DAGConfig): Promise<DAGConfig> {
   return res.json();
 }
 
-export async function listAirflowDags(): Promise<string[]> {
-  const res = await fetch(`${BASE_URL}/api/dags/list-airflow`, { method: "POST" });
+export interface AirflowDagsResult {
+  dags: { dag_id?: string }[];
+  fetched_at: string; // ISO timestamp
+  cached: boolean;
+}
+
+export async function listAirflowDags(forceRefresh = false): Promise<AirflowDagsResult> {
+  const url = `${BASE_URL}/api/dags/list-airflow${forceRefresh ? "?force_refresh=true" : ""}`;
+  const res = await fetch(url, { method: "POST" });
   if (!res.ok) throw new Error("Failed to list Airflow DAGs");
   const data = await res.json();
+  // Handle both old (plain array) and new (wrapped object) response shapes
   if (Array.isArray(data)) {
-    return (data as { dag_id?: string }[])
-      .map((d) => d.dag_id ?? "")
-      .filter(Boolean);
+    return { dags: data, fetched_at: new Date().toISOString(), cached: false };
   }
-  return [];
+  return {
+    dags: Array.isArray(data.dags) ? data.dags : [],
+    fetched_at: data.fetched_at ?? new Date().toISOString(),
+    cached: data.cached ?? false,
+  };
 }
 
 export async function triggerDagStream(
@@ -520,7 +530,7 @@ export async function fetchDagLogsStream(
   run_id: string,
   onLog: (entry: LogEntry) => void,
   onTaskLog: (taskId: string, entry: LogEntry) => void,
-  onTaskStates: (tasks: Array<{ task_id: string; state: string }>) => void,
+  onTaskStates: (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => void,
   onMappingIssues: (issues: Array<{ unmapped_value: string; count?: number; column: string }>) => void,
   onDone: () => void | Promise<void>,
   onError: (message: string) => void,
@@ -557,7 +567,7 @@ export async function fetchDagLogsStream(
         } else if (event.type === "task_log") {
           onTaskLog(event.task_id, { level: event.level ?? "info", message: event.message, timestamp: ts });
         } else if (event.type === "task_states") {
-          onTaskStates(event.tasks);
+          onTaskStates(event.tasks, event.elapsed_s);
         } else if (event.type === "mapping_issues") {
           onMappingIssues(event.issues);
         } else if (event.type === "done") {

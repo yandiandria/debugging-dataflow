@@ -6,10 +6,11 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import pandas as pd
 import polars as pl
@@ -71,6 +72,13 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
+
+# ── In-memory caches ───────────────────────────────────────────────────────────
+
+# Cache for `airflow dags list` — avoids a costly docker exec on every page load.
+# TTL: 5 minutes.  Invalidated by POST /api/dags/list-airflow?force_refresh=true.
+_airflow_dags_cache: Optional[Dict] = None
+_AIRFLOW_DAGS_CACHE_TTL = 300  # seconds
 
 
 # ── Persistence helpers ─────────────────────────────────────────────────────────
@@ -586,6 +594,24 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
 
     _TERMINAL_STATES = {"success", "failed", "upstream_failed", "skipped"}
 
+    async def _fetch_task_log(tid: str) -> Tuple[str, str]:
+        """Fetch Airflow logs for a single task. Returns (log_text, err_text)."""
+        script = (
+            f"LOGDIR=$(airflow config get-value logging base_log_folder 2>/dev/null || echo '/opt/airflow/logs');"
+            f" find \"$LOGDIR\" -type f -path '*{body.dag_id}*' -path '*{tid}*'"
+            f" 2>/dev/null | sort | xargs cat 2>/dev/null"
+        )
+        log_proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container, "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        log_stdout, log_stderr = await log_proc.communicate()
+        return (
+            log_stdout.decode() if log_stdout else "",
+            log_stderr.decode() if log_stderr else "",
+        )
+
     async def generate() -> AsyncGenerator[str, None]:
         yield _log(f"Polling tasks for DAG {body.dag_id}, run {body.run_id}…")
 
@@ -593,9 +619,12 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
         last_states: Dict[str, str] = {}
         all_mapping_issues: List[Dict] = []
         all_task_logs: str = ""
+        poll_start = time.monotonic()
 
         try:
             for _ in range(300):  # max 10 min at 2s intervals
+                elapsed_s = round(time.monotonic() - poll_start)
+
                 # ── poll task states ──────────────────────────────────────
                 proc = await asyncio.create_subprocess_exec(
                     "docker", "exec", container,
@@ -623,10 +652,11 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
                     await asyncio.sleep(2)
                     continue
 
-                # Emit live state snapshot for the status bar
+                # Emit live state snapshot (with elapsed time for the UI timer)
                 yield _sse({
                     "type": "task_states",
                     "tasks": [{"task_id": t.get("task_id", ""), "state": t.get("state", "")} for t in tasks],
+                    "elapsed_s": elapsed_s,
                 })
 
                 # Log state changes to the main terminal
@@ -636,27 +666,28 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
                         last_states[tid] = state
                         yield _log(f"{tid}: {state}", "info")
 
-                # ── fetch logs for newly-terminal tasks ───────────────────
-                for task in tasks:
-                    tid, state = task.get("task_id", ""), task.get("state", "")
-                    if state in _TERMINAL_STATES and tid and tid not in fetched_tasks:
+                # ── fetch logs for newly-terminal tasks (in parallel) ─────
+                new_terminal = [
+                    (t.get("task_id", ""), t.get("state", ""))
+                    for t in tasks
+                    if t.get("state") in _TERMINAL_STATES
+                    and t.get("task_id")
+                    and t.get("task_id") not in fetched_tasks
+                ]
+                if new_terminal:
+                    for tid, _ in new_terminal:
                         fetched_tasks.add(tid)
-                        yield _log(f"Fetching logs: {tid} ({state})", "info")
+                    yield _log(
+                        f"Fetching logs for {len(new_terminal)} task(s) in parallel: "
+                        + ", ".join(tid for tid, _ in new_terminal),
+                        "info",
+                    )
 
-                        script = (
-                            f"LOGDIR=$(airflow config get-value logging base_log_folder 2>/dev/null || echo '/opt/airflow/logs');"
-                            f" find \"$LOGDIR\" -type f -path '*{body.dag_id}*' -path '*{tid}*'"
-                            f" 2>/dev/null | sort | xargs cat 2>/dev/null"
-                        )
-                        log_proc = await asyncio.create_subprocess_exec(
-                            "docker", "exec", container, "bash", "-c", script,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        log_stdout, log_stderr = await log_proc.communicate()
-                        log_text = log_stdout.decode() if log_stdout else ""
-                        err_text = log_stderr.decode() if log_stderr else ""
+                    log_results: List[Tuple[str, str]] = await asyncio.gather(
+                        *[_fetch_task_log(tid) for tid, _ in new_terminal]
+                    )
 
+                    for (tid, state), (log_text, err_text) in zip(new_terminal, log_results):
                         for line in log_text.strip().split("\n"):
                             if line and not _is_airflow_noise(line):
                                 yield _sse({"type": "task_log", "task_id": tid, "level": "info", "message": line})
@@ -691,8 +722,23 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
 
 
 @app.post("/api/dags/list-airflow")
-async def list_airflow_dags():
-    """List DAGs from airflow CLI."""
+async def list_airflow_dags(force_refresh: bool = False):
+    """List DAGs from airflow CLI with in-memory TTL cache (5 min).
+
+    Pass ?force_refresh=true to bypass the cache and re-query Airflow.
+    The response includes `cached` (bool) and `fetched_at` (ISO timestamp)
+    so the frontend can show how fresh the data is.
+    """
+    global _airflow_dags_cache
+
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _airflow_dags_cache is not None
+        and now - _airflow_dags_cache["fetched_at_mono"] < _AIRFLOW_DAGS_CACHE_TTL
+    ):
+        return {**_airflow_dags_cache["payload"], "cached": True}
+
     config = _load_dag_config()
     container = config.get("container_name", "")
     if not container:
@@ -700,15 +746,30 @@ async def list_airflow_dags():
 
     cmd = ["docker", "exec", container, "airflow", "dags", "list", "-o", "json"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=result.stderr or "Failed to list DAGs")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            return json.loads(result.stdout)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(status_code=504, detail="Timeout listing DAGs from Airflow")
+
+        if proc.returncode != 0:
+            raise HTTPException(status_code=500, detail=stderr.decode() or "Failed to list DAGs")
+
+        fetched_at_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            dags = json.loads(stdout.decode())
         except json.JSONDecodeError:
-            return {"raw": result.stdout}
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Timeout listing DAGs from Airflow")
+            dags = []
+
+        payload = {"dags": dags, "fetched_at": fetched_at_iso}
+        _airflow_dags_cache = {"payload": payload, "fetched_at_mono": now}
+        return {**payload, "cached": False}
+
     except FileNotFoundError:
         raise HTTPException(status_code=500, detail="Docker not found")
 

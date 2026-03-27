@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import type { DAG, DAGConfig } from "../lib/api";
 import { getDags, createDag, updateDag, deleteDag, getDagConfig, updateDagConfig, listAirflowDags } from "../lib/api";
 
@@ -74,12 +74,27 @@ export default function DAGManager({ onBack }: Props) {
   const [configDraft, setConfigDraft] = useState("");
   const [configEnvsDraft, setConfigEnvsDraft] = useState("");
   const [airflowDags, setAirflowDags] = useState<string[]>([]);
+  const [airflowDagsLoading, setAirflowDagsLoading] = useState(false);
+  const [airflowDagsFetchedAt, setAirflowDagsFetchedAt] = useState<Date | null>(null);
+  const [airflowDagsCached, setAirflowDagsCached] = useState(false);
+
+  const fetchAirflowDags = useCallback(async (forceRefresh = false) => {
+    setAirflowDagsLoading(true);
+    try {
+      const result = await listAirflowDags(forceRefresh);
+      setAirflowDags(result.dags.map((d) => d.dag_id ?? "").filter(Boolean));
+      setAirflowDagsFetchedAt(new Date(result.fetched_at));
+      setAirflowDagsCached(result.cached);
+    } catch { /* ignore */ } finally {
+      setAirflowDagsLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     getDags().then(setDags).catch(() => {});
     getDagConfig().then((c) => setConfig(c)).catch(() => {});
-    listAirflowDags().then(setAirflowDags).catch(() => {});
-  }, []);
+    fetchAirflowDags();
+  }, [fetchAirflowDags]);
 
   const refresh = async () => {
     const d = await getDags();
@@ -233,9 +248,35 @@ export default function DAGManager({ onBack }: Props) {
 
         {/* DAG list */}
         <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-          <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-2.5 bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-500">
+          <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-2.5 bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-500 items-center">
             <span>Display name</span>
-            <span>Airflow DAG ID</span>
+            <div className="flex items-center gap-2">
+              <span>Airflow DAG ID</span>
+              {/* Autocomplete source status */}
+              <span className="font-normal text-gray-400">
+                {airflowDagsLoading ? (
+                  <span className="animate-pulse">fetching suggestions…</span>
+                ) : airflowDagsFetchedAt ? (
+                  <>
+                    {airflowDagsCached ? "cached · " : ""}
+                    {airflowDags.length} suggestions ·{" "}
+                    <button
+                      onClick={() => fetchAirflowDags(true)}
+                      className="underline hover:text-indigo-600"
+                    >
+                      refresh
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => fetchAirflowDags(true)}
+                    className="underline hover:text-indigo-600"
+                  >
+                    load suggestions
+                  </button>
+                )}
+              </span>
+            </div>
             <span>Actions</span>
           </div>
 
