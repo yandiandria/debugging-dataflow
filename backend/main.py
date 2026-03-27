@@ -621,10 +621,12 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
 
                 if stdout_text:
                     for line in stdout_text.strip().split("\n"):
-                        yield _log(line, "info")
+                        if not _is_airflow_noise(line):
+                            yield _log(line, "info")
                 if stderr_text:
                     for line in stderr_text.strip().split("\n"):
-                        yield _log(line, "warning")
+                        if not _is_airflow_noise(line):
+                            yield _log(line, "warning")
 
                 all_logs += stdout_text + "\n" + stderr_text + "\n"
 
@@ -682,6 +684,16 @@ async def list_dag_runs(dag_id: Optional[str] = None):
 
 
 # ── Mapping issue parsing & endpoints ─────────────────────────────────────────
+
+_AIRFLOW_NOISE_SUBSTRINGS = [
+    "Could not import graphviz",
+    "Rendering graph to the graphical format will not be possible",
+]
+
+
+def _is_airflow_noise(line: str) -> bool:
+    return any(s in line for s in _AIRFLOW_NOISE_SUBSTRINGS)
+
 
 def _parse_mapping_issues(log_text: str) -> List[Dict]:
     """Parse mapping issue lines from Airflow logs.
