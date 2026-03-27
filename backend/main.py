@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -11,6 +12,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("dataflow")
 
 import pandas as pd
 import polars as pl
@@ -575,7 +583,75 @@ async def update_dag_config(body: DAGConfigUpdate):
 
 @app.get("/api/dags")
 async def list_dags() -> List[DAG]:
-    return [DAG(**d) for d in _load_json(DAGS_FILE)]
+    req_id = uuid.uuid4().hex[:8]
+    t0 = time.perf_counter()
+    logger.debug("[%s] GET /api/dags — handler entered", req_id)
+
+    logger.debug("[%s] DAGS_FILE path = %s", req_id, DAGS_FILE)
+    logger.debug("[%s] DAGS_FILE exists = %s", req_id, DAGS_FILE.exists())
+
+    if DAGS_FILE.exists():
+        stat = DAGS_FILE.stat()
+        logger.debug(
+            "[%s] DAGS_FILE size = %d bytes, mtime = %s",
+            req_id,
+            stat.st_size,
+            datetime.fromtimestamp(stat.st_mtime).isoformat(),
+        )
+    else:
+        logger.warning("[%s] DAGS_FILE does not exist — will return []", req_id)
+
+    logger.debug("[%s] calling _load_json …", req_id)
+    t1 = time.perf_counter()
+    raw = _load_json(DAGS_FILE)
+    t2 = time.perf_counter()
+    logger.debug(
+        "[%s] _load_json returned %d records in %.3f ms",
+        req_id,
+        len(raw),
+        (t2 - t1) * 1000,
+    )
+
+    if raw:
+        logger.debug("[%s] first raw record keys: %s", req_id, list(raw[0].keys()))
+        logger.debug("[%s] first raw record: %s", req_id, json.dumps(raw[0]))
+    else:
+        logger.debug("[%s] raw list is empty", req_id)
+
+    logger.debug("[%s] deserialising %d records into DAG models …", req_id, len(raw))
+    t3 = time.perf_counter()
+    try:
+        dags = [DAG(**d) for d in raw]
+    except Exception as exc:
+        logger.exception("[%s] failed to deserialise DAG records: %s", req_id, exc)
+        raise
+    t4 = time.perf_counter()
+    logger.debug(
+        "[%s] deserialised %d DAG objects in %.3f ms",
+        req_id,
+        len(dags),
+        (t4 - t3) * 1000,
+    )
+
+    for i, dag in enumerate(dags):
+        logger.debug(
+            "[%s]   dag[%d]: id=%s dag_id=%s display_name=%r created_at=%s",
+            req_id,
+            i,
+            dag.id,
+            dag.dag_id,
+            dag.display_name,
+            dag.created_at,
+        )
+
+    total_ms = (time.perf_counter() - t0) * 1000
+    logger.debug(
+        "[%s] GET /api/dags — returning %d DAGs, total handler time %.3f ms",
+        req_id,
+        len(dags),
+        total_ms,
+    )
+    return dags
 
 
 @app.post("/api/dags", status_code=201)
