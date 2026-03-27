@@ -1594,7 +1594,7 @@ def _process_stage_sync(
 ) -> tuple:
     """Read CSVs, merge, filter, dedup. Returns (merged_df, dedup_info, log_lines). Runs sync — use to_thread."""
     logs: List[tuple] = []
-    dfs = [pl.read_csv(p, infer_schema_length=10000) for p in local_paths]
+    dfs = [pl.read_csv(p, infer_schema_length=None) for p in local_paths]
     merged = pl.concat(dfs, how="diagonal")
     logs.append(("success", f"{len(merged)} rows after merge."))
 
