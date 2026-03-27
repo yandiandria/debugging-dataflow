@@ -26,8 +26,9 @@ from fastapi.responses import StreamingResponse
 from notion_client import AsyncClient as NotionAsyncClient
 from pydantic import BaseModel
 
-BLOB_CACHE_DIR = Path(".cache/dataflow/blobs")
-HISTORY_DIR = Path(".data/history")
+# Resolved after DATA_DIR is set below — see the DATA_DIR block.
+
+_MAX_DAG_RUNS = 200  # cap dag_runs.json from growing unbounded
 
 # Pipeline stage order (most specific names first for detection; order reflects pipeline flow)
 STAGE_ORDER = [
@@ -97,6 +98,11 @@ _AIRFLOW_DAGS_CACHE_TTL = 300  # seconds
 DATA_DIR = Path(os.environ.get("DATAFLOW_DATA_DIR", "")).expanduser() if os.environ.get("DATAFLOW_DATA_DIR") else Path(__file__).parent
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# These live inside DATA_DIR so they survive on Docker volumes when
+# DATAFLOW_DATA_DIR is set (previously they were hardcoded relative paths).
+BLOB_CACHE_DIR = DATA_DIR / ".cache" / "dataflow" / "blobs"
+HISTORY_DIR = DATA_DIR / "history"
+
 RESOURCES_FILE = DATA_DIR / "resources.json"
 DAGS_FILE = DATA_DIR / "dags.json"
 DAG_CONFIG_FILE = DATA_DIR / "dag_config.json"
@@ -114,7 +120,11 @@ def _load_json(path: Path) -> List[Dict]:
 
 
 def _save_json(path: Path, data: List[Dict]) -> None:
-    path.write_text(json.dumps(data, indent=2))
+    # Write to a sibling .tmp file then rename so a crash mid-write never
+    # leaves a corrupted JSON file behind (rename is atomic on POSIX).
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
 
 
 def _load_resources() -> List[Dict]:
@@ -132,7 +142,9 @@ def _load_dag_config() -> Dict:
 
 
 def _save_dag_config(config: Dict) -> None:
-    DAG_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    tmp = DAG_CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    tmp.replace(DAG_CONFIG_FILE)
 
 
 def _load_notion_config() -> Dict:
@@ -142,7 +154,9 @@ def _load_notion_config() -> Dict:
 
 
 def _save_notion_config(config: Dict) -> None:
-    NOTION_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    tmp = NOTION_CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    tmp.replace(NOTION_CONFIG_FILE)
 
 
 # Notion property types that can be written via the API
@@ -553,7 +567,7 @@ async def import_config(body: ConfigImportBody):
     if body.dags is not None:
         _save_json(DAGS_FILE, body.dags); written.append("dags")
     if body.dag_config is not None:
-        DAG_CONFIG_FILE.write_text(json.dumps(body.dag_config, indent=2)); written.append("dag_config")
+        _save_dag_config(body.dag_config); written.append("dag_config")
     if body.rules is not None:
         _save_json(RULES_FILE, body.rules); written.append("rules")
     if body.mapping_issues is not None:
@@ -707,6 +721,48 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
     )
 
 
+async def _fetch_single_task_log(
+    client: httpx.AsyncClient,
+    auth_header: str,
+    log_url: str,
+    params: Dict,
+    task_id: str,
+    map_index: int,
+    try_number: int,
+    state: str,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """Fetch log for a single task instance, with retry on 404 (log not yet available)."""
+    log_text = ""
+    log_status = "not_found"
+    for attempt in range(max_retries):
+        try:
+            log_resp = await client.get(log_url, params=params, headers={"Authorization": auth_header})
+            if log_resp.status_code == 200:
+                log_text = log_resp.text
+                log_status = "success"
+                break
+            elif log_resp.status_code == 404:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                else:
+                    log_status = "not_found"
+            else:
+                log_status = f"error_{log_resp.status_code}"
+                break
+        except Exception:
+            log_status = "exception"
+            break
+    return {
+        "task_id": task_id,
+        "map_index": map_index,
+        "try_number": try_number,
+        "state": state,
+        "logs": log_text,
+        "status": log_status,
+    }
+
+
 @app.post("/api/dags/logs-rest-api")
 async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse:
     """Fetch Airflow logs using the REST API instead of Docker/filesystem.
@@ -828,100 +884,36 @@ async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse
 
                 yield _log(f"Total task instances: {len(all_task_instances)}", "success")
 
-                # Step 3: Fetch logs for each task instance
-                yield _log(f"Fetching logs for {len(all_task_instances)} task instance(s)...", "info")
+                # Step 3: Fetch all task logs concurrently (previously sequential,
+                # which caused up to N * 3 * 2s wait for N tasks with 404 retries).
+                yield _log(f"Fetching logs for {len(all_task_instances)} task instance(s) concurrently...", "info")
 
-                all_logs: List[Dict[str, Any]] = []
-
-                for idx, ti in enumerate(all_task_instances, 1):
+                fetch_coros = []
+                for ti in all_task_instances:
                     task_id = ti.get("task_id", "")
                     try_number = ti.get("try_number", 1)
                     map_index = ti.get("map_index", -1)
-                    state = ti.get("state", "unknown")
-
                     task_id_encoded = quote(task_id, safe="")
-
-                    # Build log URL
                     log_url = (
                         f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns/{run_id_encoded}/"
                         f"taskInstances/{task_id_encoded}/logs/{try_number}"
                     )
-
-                    # Add map_index if this is a mapped task
-                    params = {}
+                    params: Dict = {}
                     if map_index >= 0:
                         params["map_index"] = str(map_index)
+                    fetch_coros.append(_fetch_single_task_log(
+                        client, auth_header, log_url, params,
+                        task_id, map_index, try_number, ti.get("state", "unknown"),
+                    ))
 
-                    try:
-                        log_text = ""
-                        log_status = "not_found"
-                        max_retries = 3
+                all_logs: List[Dict[str, Any]] = list(await asyncio.gather(*fetch_coros))
 
-                        # Retry logic for 404s (logs not ready yet)
-                        for attempt in range(max_retries):
-                            log_resp = await client.get(
-                                log_url,
-                                params=params,
-                                headers={"Authorization": auth_header}
-                            )
+                # Surface any tasks that had errors
+                for log_entry in all_logs:
+                    if log_entry["status"] not in ("success", "not_found"):
+                        yield _log(f"Task {log_entry['task_id']}: {log_entry['status']}", "warning")
 
-                            if log_resp.status_code == 200:
-                                log_text = log_resp.text
-                                log_status = "success"
-                                break
-                            elif log_resp.status_code == 404:
-                                # Logs not ready, wait and retry
-                                if attempt < max_retries - 1:
-                                    yield _log(
-                                        f"[{idx}/{len(all_task_instances)}] {task_id}: Logs not ready, retrying... ({attempt + 1}/{max_retries})",
-                                        "info"
-                                    )
-                                    await asyncio.sleep(2)  # Wait 2 seconds before retry
-                                else:
-                                    log_status = "not_found"
-                                    yield _log(
-                                        f"[{idx}/{len(all_task_instances)}] {task_id}: No logs available after {max_retries} attempts",
-                                        "warning"
-                                    )
-                            else:
-                                log_status = f"error_{log_resp.status_code}"
-                                yield _log(
-                                    f"[{idx}/{len(all_task_instances)}] {task_id}: HTTP {log_resp.status_code}",
-                                    "warning"
-                                )
-                                break
-
-                        if log_text and state == "success":
-                            yield _log(
-                                f"[{idx}/{len(all_task_instances)}] {task_id}"
-                                f"(map_index={map_index}, try={try_number}, state={state}): "
-                                f"{len(log_text)} bytes",
-                                "success"
-                            )
-
-                        all_logs.append({
-                            "task_id": task_id,
-                            "map_index": map_index,
-                            "try_number": try_number,
-                            "state": state,
-                            "logs": log_text,
-                            "status": log_status
-                        })
-                    except Exception as e:
-                        yield _log(
-                            f"[{idx}/{len(all_task_instances)}] {task_id}: Exception: {e}",
-                            "error"
-                        )
-                        all_logs.append({
-                            "task_id": task_id,
-                            "map_index": map_index,
-                            "try_number": try_number,
-                            "state": state,
-                            "logs": "",
-                            "status": "exception"
-                        })
-
-                yield _log(f"Log fetching complete", "success")
+                yield _log("Log fetching complete", "success")
                 yield _sse({
                     "type": "done",
                     "dag_id": body.dag_id,
@@ -996,7 +988,6 @@ async def list_airflow_dags(force_refresh: bool = False):
 # ── DAG run history ───────────────────────────────────────────────────────────
 
 _LOG_KEYS = {"task_logs", "task_sub_logs", "stdout", "stderr"}
-_MAX_DAG_RUNS = 200  # cap to prevent dag_runs.json from growing unbounded
 
 
 def _strip_logs(run: Dict) -> Dict:
@@ -1349,10 +1340,42 @@ async def get_column_values_v2(request: ColumnValuesRequest):
     return {"values": sorted_values[:request.limit], "total": len(sorted_values)}
 
 
+def _collect_blobs(
+    client: ContainerClient,
+    prefix: Optional[str],
+    extract_only: bool,
+    date_from: Optional[datetime],
+    date_to: Optional[datetime],
+    seen: set,
+    blobs: List["BlobInfo"],
+) -> None:
+    """Append CSV blobs from *client* into *blobs*, skipping duplicates and applying date/stage filters."""
+    for blob in client.list_blobs(name_starts_with=prefix):
+        if not blob.name.lower().endswith(".csv"):
+            continue
+        lm = blob.last_modified
+        if lm:
+            if date_from and lm < date_from:
+                continue
+            if date_to and lm > date_to:
+                continue
+        if blob.name in seen:
+            continue
+        stage = detect_stage(blob.name)
+        if extract_only and stage != "extract":
+            continue
+        seen.add(blob.name)
+        blobs.append(BlobInfo(
+            name=blob.name,
+            size=blob.size or 0,
+            last_modified=lm.isoformat() if lm else "",
+            detected_stage=stage,
+        ))
+
+
 @app.post("/api/blobs/list")
 async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
     """List all CSV blobs in the container, optionally filtered by last_modified date."""
-    from datetime import datetime, timezone
     try:
         date_from = (
             datetime.fromisoformat(request.date_from).replace(tzinfo=timezone.utc)
@@ -1367,35 +1390,51 @@ async def list_blobs(request: BlobListRequest) -> List[BlobInfo]:
         seen: set = set()
         blobs: List[BlobInfo] = []
 
-        def _collect(name_starts_with: Optional[str], extract_only: bool = False) -> None:
-            for blob in client.list_blobs(name_starts_with=name_starts_with):
-                if not blob.name.lower().endswith(".csv"):
-                    continue
-                lm = blob.last_modified
-                if lm:
-                    if date_from and lm < date_from:
-                        continue
-                    if date_to and lm > date_to:
-                        continue
-                if blob.name in seen:
-                    continue
-                stage = detect_stage(blob.name)
-                if extract_only and stage != "extract":
-                    continue
-                seen.add(blob.name)
-                blobs.append(BlobInfo(
-                    name=blob.name,
-                    size=blob.size or 0,
-                    last_modified=lm.isoformat() if lm else "",
-                    detected_stage=stage,
-                ))
-
-        _collect(request.prefix or None)
+        _collect_blobs(client, request.prefix or None, False, date_from, date_to, seen, blobs)
         for ep in request.extract_prefixes:
             ep = ep.strip()
             if ep:
-                _collect(ep, extract_only=True)
+                _collect_blobs(client, ep, True, date_from, date_to, seen, blobs)
 
+        return blobs
+    except AzureError as e:
+        raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/resources/{resource_id}/blobs")
+async def get_resource_blobs(
+    resource_id: str,
+    container_url: str,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[BlobInfo]:
+    """List CSV blobs scoped to a single resource (by technical_name + extract_prefixes)."""
+    resources_list = _load_resources()
+    resource = next((r for r in resources_list if r["id"] == resource_id), None)
+    if not resource:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    try:
+        date_from_dt = (
+            datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
+            if date_from else None
+        )
+        date_to_dt = (
+            datetime.fromisoformat(date_to).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+            if date_to else None
+        )
+        client = build_container_client(container_url)
+        seen: set = set()
+        blobs: List[BlobInfo] = []
+        tech_name = resource.get("technical_name", "")
+        extract_prefixes = resource.get("extract_prefixes") or []
+        if tech_name:
+            _collect_blobs(client, tech_name, False, date_from_dt, date_to_dt, seen, blobs)
+        for ep in extract_prefixes:
+            ep = ep.strip()
+            if ep:
+                _collect_blobs(client, ep, True, date_from_dt, date_to_dt, seen, blobs)
         return blobs
     except AzureError as e:
         raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
@@ -1709,9 +1748,10 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
     merging and processing per stage, then building the row-flow report.
 
     Event shapes:
-      {"type": "log",    "level": "info|success|warning|error", "message": "..."}
-      {"type": "result", "data": {...}, "downloaded_files": [...], "tmp_dir": "..."}
-      {"type": "error",  "message": "..."}
+      {"type": "log",          "level": "info|success|warning|error", "message": "..."}
+      {"type": "stage_result", "stage": "...", "row_count": N}
+      {"type": "result",       "data": {...}, "downloaded_files": [...], "tmp_dir": "..."}
+      {"type": "error",        "message": "..."}
     """
     if not request.key_columns:
         raise HTTPException(status_code=400, detail="At least one key column is required.")
@@ -1721,48 +1761,82 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
     async def generate() -> AsyncGenerator[str, None]:
         BLOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        downloaded_files: List[str] = []
 
         try:
             yield _log("Connecting to Azure container…")
             client = build_container_client(request.container_url)
             yield _log("Connected.", "success")
 
-            # ── 1. Group blobs by stage ────────────────────────────────────────
+            # ── 1. Identify which blobs need downloading ───────────────────────
+            to_download: List[Tuple[str, Path]] = []
+            for blob_name in request.selected_blobs:
+                cache_path = _blob_cache_path(request.container_url, blob_name)
+                if not cache_path.exists() or request.force_refresh:
+                    to_download.append((blob_name, cache_path))
+
+            cached_count = len(request.selected_blobs) - len(to_download)
+            if cached_count:
+                yield _log(f"{cached_count} file(s) from cache.", "info")
+
+            # ── 2. Download all missing blobs in parallel ──────────────────────
+            if to_download:
+                yield _log(f"Downloading {len(to_download)} file(s) in parallel…")
+
+                async def _dl_one(blob_name: str, cache_path: Path) -> int:
+                    bc = client.get_blob_client(blob_name)
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    return await asyncio.to_thread(_download_blob_to_disk, bc, str(cache_path))
+
+                dl_results = await asyncio.gather(
+                    *[_dl_one(bn, cp) for bn, cp in to_download],
+                    return_exceptions=True,
+                )
+                failed: List[str] = []
+                total_kb = 0.0
+                for (bn, _), res in zip(to_download, dl_results):
+                    if isinstance(res, Exception):
+                        failed.append(bn)
+                        yield _log(f"Download failed for {bn}: {res}", "error")
+                    else:
+                        total_kb += res / 1024  # type: ignore[operator]
+                if failed:
+                    yield _log(f"{len(failed)} file(s) failed to download — they will be skipped.", "warning")
+                else:
+                    yield _log(f"Downloaded {len(to_download)} file(s) ({total_kb:.0f} KB total).", "success")
+
+            downloaded_files = [str(_blob_cache_path(request.container_url, bn)) for bn in request.selected_blobs]
+
+            # ── 3. Group blobs by stage ────────────────────────────────────────
             stage_blobs: Dict[str, List[str]] = {}
             for blob_name in request.selected_blobs:
                 stage = detect_stage(blob_name) or "unknown"
                 stage_blobs.setdefault(stage, []).append(blob_name)
 
+            ordered_stages = (
+                [s for s in STAGE_ORDER if s in stage_blobs]
+                + [s for s in stage_blobs if s not in STAGE_ORDER]
+            )
             yield _log(
-                f"Grouped {len(request.selected_blobs)} file(s) into "
-                f"{len(stage_blobs)} stage(s): {', '.join(stage_blobs.keys())}."
+                f"Processing {len(ordered_stages)} stage(s): {', '.join(ordered_stages)}."
             )
 
-            # ── 2. Download → disk (or reuse cache), merge, filter, dedup per stage ──
+            # ── 4. Process each stage and stream per-stage results ─────────────
             stage_dfs: Dict[str, pl.DataFrame] = {}
             dedup_warnings: Dict[str, Dict[str, int]] = {}
             active_filters = [f for f in request.filters if f.column and f.value]
 
-            for stage, blobs in stage_blobs.items():
-                local_paths: List[str] = []
+            for stage in ordered_stages:
+                blobs = stage_blobs[stage]
+                local_paths = [
+                    str(_blob_cache_path(request.container_url, bn))
+                    for bn in blobs
+                    if _blob_cache_path(request.container_url, bn).exists()
+                ]
+                if not local_paths:
+                    yield _log(f"[{stage}] No usable files — skipped.", "warning")
+                    continue
 
-                for blob_name in blobs:
-                    cache_path = _blob_cache_path(request.container_url, blob_name)
-                    if cache_path.exists() and not request.force_refresh:
-                        yield _log(f"[{stage}] {blob_name} — using cached file", "info")
-                    else:
-                        yield _log(f"[{stage}] Downloading {blob_name}…")
-                        blob_client = client.get_blob_client(blob_name)
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        size_bytes = await asyncio.to_thread(
-                            _download_blob_to_disk, blob_client, str(cache_path)
-                        )
-                        yield _log(f"[{stage}] Saved ({size_bytes / 1024:.1f} KB)", "success")
-                    downloaded_files.append(str(cache_path))
-                    local_paths.append(str(cache_path))
-
-                yield _log(f"[{stage}] Merging and processing {len(local_paths)} file(s)…")
+                yield _log(f"[{stage}] Merging {len(local_paths)} file(s)…")
                 merged, dedup_info, stage_logs = await asyncio.to_thread(
                     _process_stage_sync,
                     local_paths,
@@ -1776,24 +1850,20 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                 if dedup_info:
                     dedup_warnings[stage] = dedup_info
                 stage_dfs[stage] = merged
+                # Emit per-stage result so the frontend can display progressive output
+                yield _sse({"type": "stage_result", "stage": stage, "row_count": len(merged)})
 
-            # ── 3. Build flow report ───────────────────────────────────────────
+            # ── 5. Build cross-stage flow report ──────────────────────────────
             yield _log("Building flow report…")
-            ordered_stages = (
-                [s for s in STAGE_ORDER if s in stage_dfs]
-                + [s for s in stage_dfs if s not in STAGE_ORDER]
-            )
-
             rows, columns_per_stage = await asyncio.to_thread(
                 _build_flow_report, stage_dfs, request.key_columns, ordered_stages, dedup_warnings
             )
-
             yield _log(
                 f"Done — {len(rows)} record(s) traced across {len(ordered_stages)} stage(s).",
                 "success",
             )
 
-            # ── 4. Save to history and emit final result ──────────────────────
+            # ── 6. Save to history and emit final result ───────────────────────
             result_data = {
                 "stages": ordered_stages,
                 "key_columns": request.key_columns,
@@ -1802,17 +1872,18 @@ async def analyze(request: AnalyzeRequest) -> StreamingResponse:
                 "dedup_warnings": dedup_warnings,
             }
             entry_id = str(uuid.uuid4())
-            (HISTORY_DIR / f"{entry_id}.json").write_text(
-                json.dumps(
-                    {
-                        "id": entry_id,
-                        "saved_at": datetime.now(timezone.utc).isoformat(),
-                        "request": request.model_dump(),
-                        "result": result_data,
-                    },
-                    default=str,
-                )
-            )
+            history_path = HISTORY_DIR / f"{entry_id}.json"
+            tmp = history_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {
+                    "id": entry_id,
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "request": request.model_dump(),
+                    "result": result_data,
+                },
+                default=str,
+            ))
+            tmp.replace(history_path)
 
             yield _sse({
                 "type": "result",

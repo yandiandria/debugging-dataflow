@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import ConnectionForm from "../components/ConnectionForm";
 import FileBrowser from "../components/FileBrowser";
 import AnalysisConfig from "../components/AnalysisConfig";
@@ -43,7 +43,9 @@ function detectBatchStart(matchingBlobs: BlobInfo[]): string {
 
 export default function Home() {
   const [step, setStep] = useState<Step>("connect");
-  const [containerUrl, setContainerUrl] = useState("");
+  const [containerUrl, setContainerUrl] = useState(
+    () => localStorage.getItem("dataflow_container_url") ?? ""
+  );
   const [blobs, setBlobs] = useState<BlobInfo[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<AnalyzeResultFull | null>(null);
@@ -113,6 +115,14 @@ export default function Home() {
   useEffect(() => {
     getResources().then(setResources).catch(() => {});
   }, []);
+
+  // Auto-navigate to dashboard on first load when saved containerUrl + resources are available
+  const hasAutoNavigated = useRef(false);
+  useEffect(() => {
+    if (hasAutoNavigated.current || resources.length === 0 || !containerUrl) return;
+    hasAutoNavigated.current = true;
+    setStep("dashboard");
+  }, [resources, containerUrl]);
 
   const refreshResources = () => getResources().then(setResources).catch(() => {});
 
@@ -288,6 +298,42 @@ export default function Home() {
     setStep("browse");
   };
 
+  // ── QA Example → Analysis ──────────────────────────────────────────────────
+  // Called from ResourceDashboard when the user clicks "Trace →" on a QA example.
+  // Pre-selects the resource blobs and configures the analysis to filter on the
+  // specific record, then navigates to the config step so the user can review
+  // before running.
+  const handleAnalyzeQAExample = (
+    _resource: Resource,
+    blobNames: string[],
+    idColumn: string,
+    idValue: string,
+  ) => {
+    setSelected(new Set(blobNames));
+    setInitialConfig({
+      keyColumns: [idColumn],
+      filters: [{ column: idColumn, value: idValue, filter_type: "equals" }],
+      deduplicate: true,
+      filterLogic: "AND",
+    });
+    setResult(null);
+    setLogs([]);
+    setError(null);
+    setStep("config");
+  };
+
+  // ── Trace latest batch ────────────────────────────────────────────────────
+  // Called from ResourceDashboard when the user clicks "Trace latest batch".
+  // Pre-selects the detected batch blobs and navigates to the config step.
+  const handleTraceBatch = (blobNames: string[]) => {
+    setSelected(new Set(blobNames));
+    setResult(null);
+    setLogs([]);
+    setError(null);
+    setInitialConfig(undefined);
+    setStep("config");
+  };
+
   const handleLoadHistoryResult = (data: AnalyzeResultFull) => {
     setResult(data);
     setStep("results");
@@ -345,9 +391,10 @@ export default function Home() {
     content = (
       <ResourceDashboard
         resources={resources}
-        blobs={blobs}
         containerUrl={containerUrl}
         onBack={() => setStep("browse")}
+        onAnalyzeExample={handleAnalyzeQAExample}
+        onTraceBatch={handleTraceBatch}
       />
     );
   } else if (step === "browse") {
@@ -362,44 +409,35 @@ export default function Home() {
                 files you want to trace across pipeline stages
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-3">
               <button
                 onClick={handleRefreshBlobs}
                 disabled={loading || !connectionParams}
-                className="text-sm bg-gray-600 hover:bg-gray-700 disabled:bg-gray-400 text-white px-3 py-1.5 rounded-lg transition-colors"
+                className="text-sm text-gray-500 hover:text-gray-700 disabled:text-gray-300 border border-gray-200 px-3 py-1.5 rounded-lg transition-colors"
               >
-                {loading ? "Refreshing…" : "Refresh blobs"}
+                {loading ? "Refreshing…" : "↺ Refresh"}
               </button>
-              <button
-                onClick={() => setStep("history")}
-                className="text-sm bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-              >
-                History
-              </button>
-              <button
-                onClick={() => setStep("dashboard")}
-                className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-              >
-                Dashboard
-              </button>
-              <button
-                onClick={() => setStep("dags")}
-                className="text-sm bg-gray-600 hover:bg-gray-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-              >
-                DAGs
-              </button>
-              <button
-                onClick={() => setStep("rules")}
-                className="text-sm bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-              >
-                Rules
-              </button>
-              <button
-                onClick={() => setStep("notion")}
-                className="text-sm bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded-lg transition-colors"
-              >
-                Injection Tracker
-              </button>
+              {/* Unified navigation group — all sections of the tool at equal visual weight */}
+              <div className="flex items-center divide-x divide-gray-200 border border-gray-200 rounded-lg overflow-hidden bg-white">
+                {(
+                  [
+                    ["dashboard", "Dashboard"],
+                    ["resources", "Resources"],
+                    ["dags", "DAGs"],
+                    ["rules", "Rules"],
+                    ["history", "History"],
+                    ["notion", "Notion"],
+                  ] as [Step, string][]
+                ).map(([s, label]) => (
+                  <button
+                    key={s}
+                    onClick={() => setStep(s)}
+                    className="text-sm px-3 py-1.5 text-gray-600 hover:bg-gray-50 hover:text-gray-900 transition-colors"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
           <FileBrowser

@@ -14,16 +14,20 @@ import {
   triggerDagStream, fetchDagLogsRestApi,
   linkResourceDags,
   profileBlobsStream,
+  getResourceBlobs,
 } from "../lib/api";
 
 interface Props {
   resources: Resource[];
-  blobs: BlobInfo[];
   containerUrl: string;
   onBack: () => void;
+  /** Called when the user clicks "Trace" on a QA example. */
+  onAnalyzeExample?: (resource: Resource, blobNames: string[], idColumn: string, idValue: string) => void;
+  /** Called when the user clicks "Trace latest batch" — passes the blob names of the latest batch. */
+  onTraceBatch?: (blobNames: string[]) => void;
 }
 
-export default function ResourceDashboard({ resources, blobs, containerUrl, onBack }: Props) {
+export default function ResourceDashboard({ resources, containerUrl, onBack, onAnalyzeExample, onTraceBatch }: Props) {
   // Selection — persisted across reloads
   const [selectedResourceId, setSelectedResourceId] = useState<string>(() => {
     const saved = localStorage.getItem("dashboard_selectedResourceId");
@@ -63,6 +67,27 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const [loadingLogsForDagId, setLoadingLogsForDagId] = useState<string | null>(null);
   const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
+  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Tick elapsed time while a DAG is running
+  useEffect(() => {
+    if (runningDagId !== null) {
+      elapsedTimerRef.current = setInterval(() => {
+        setRunElapsedS((prev) => prev + 1);
+      }, 1000);
+    } else {
+      if (elapsedTimerRef.current !== null) {
+        clearInterval(elapsedTimerRef.current);
+        elapsedTimerRef.current = null;
+      }
+    }
+    return () => {
+      if (elapsedTimerRef.current !== null) {
+        clearInterval(elapsedTimerRef.current);
+        elapsedTimerRef.current = null;
+      }
+    };
+  }, [runningDagId]);
 
   // Airflow REST API config
   const [airflowConfig, setAirflowConfig] = useState<AirflowConfig>(() => {
@@ -116,10 +141,18 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
 
   const selectedResource = resources.find((r) => r.id === selectedResourceId);
 
-  const resourceBlobs = useMemo(() => {
-    if (!selectedResource) return [];
-    return blobs.filter((b) => b.name.startsWith(selectedResource.technical_name));
-  }, [selectedResource, blobs]);
+  // Lazily fetch blobs for the selected resource from the backend
+  const [resourceBlobs, setResourceBlobs] = useState<BlobInfo[]>([]);
+  const [loadingBlobs, setLoadingBlobs] = useState(false);
+
+  useEffect(() => {
+    if (!selectedResource || !containerUrl) { setResourceBlobs([]); return; }
+    setLoadingBlobs(true);
+    getResourceBlobs(selectedResource.id, containerUrl)
+      .then(setResourceBlobs)
+      .catch(() => setResourceBlobs([]))
+      .finally(() => setLoadingBlobs(false));
+  }, [selectedResource?.id, containerUrl]);
 
   // Load data in two phases:
   // Phase 1 (critical, fast) — getDags + getDagConfig fire first so linkedDags
@@ -217,6 +250,22 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
         }));
       },
     );
+  };
+
+  // Trace latest batch — detects the last gap > GAP_MINUTES and selects blobs after it
+  const handleTraceBatch = () => {
+    if (!onTraceBatch || resourceBlobs.length === 0) return;
+    const GAP_MINUTES = 15;
+    const sorted = [...resourceBlobs]
+      .filter((b) => b.last_modified)
+      .sort((a, b) => a.last_modified.localeCompare(b.last_modified));
+    let batchStartIndex = 0;
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = new Date(sorted[i - 1].last_modified).getTime();
+      const curr = new Date(sorted[i].last_modified).getTime();
+      if ((curr - prev) / (1000 * 60) > GAP_MINUTES) batchStartIndex = i;
+    }
+    onTraceBatch(sorted.slice(batchStartIndex).map((b) => b.name));
   };
 
   // DAG runner
@@ -660,34 +709,34 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
             {qaExamples.length > 0 && (
               <div className="space-y-1 mb-3">
                 {qaExamples.map((ex) => (
-                  <div key={ex.id} className="flex items-center justify-between py-1">
+                  <div key={ex.id} className="flex items-center justify-between py-1 group">
                     <div>
                       <span className="text-sm font-mono text-gray-800">{ex.id_value}</span>
                       <span className="text-xs text-gray-400 ml-2">({ex.id_column})</span>
-                      <span className="text-xs text-gray-500 ml-2">- {ex.label}</span>
+                      <span className="text-xs text-gray-500 ml-2">— {ex.label}</span>
                     </div>
                     <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => {
-                          // Execute QA example: query the data flow for this ID
-                          setDagLogs([]);
-                          setDagLogs((prev) => [
-                            ...prev,
-                            { level: "info", message: `Executing QA example: ${ex.label}`, timestamp: new Date().toISOString() },
-                            { level: "info", message: `Filter: ${ex.id_column} = ${ex.id_value}`, timestamp: new Date().toISOString() },
-                          ]);
-                          // Note: Full query execution would require the same data source (container_url + selected blobs)
-                          // This is a placeholder showing the example details
-                        }}
-                        className="text-xs text-indigo-600 hover:text-indigo-800"
-                      >
-                        Execute
-                      </button>
+                      {onAnalyzeExample && (
+                        <button
+                          onClick={() => onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), ex.id_column, ex.id_value)}
+                          disabled={resourceBlobs.length === 0 || !containerUrl}
+                          title={
+                            !containerUrl
+                              ? "Connect to a container first to trace this record"
+                              : resourceBlobs.length === 0
+                              ? "No blobs matched for this resource"
+                              : `Trace ${ex.id_column} = ${ex.id_value} through all pipeline stages`
+                          }
+                          className="text-xs text-indigo-600 hover:text-indigo-800 disabled:text-gray-300 border border-indigo-200 hover:border-indigo-400 disabled:border-gray-200 px-2 py-0.5 rounded font-medium transition-colors"
+                        >
+                          Trace →
+                        </button>
+                      )}
                       <button
                         onClick={() => handleDeleteQAExample(ex.id)}
-                        className="text-xs text-gray-400 hover:text-red-500"
+                        className="text-xs text-gray-300 hover:text-red-500 transition-colors"
                       >
-                        x
+                        ×
                       </button>
                     </div>
                   </div>
@@ -785,6 +834,16 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
               )}
             </h3>
             <div className="flex items-center gap-2">
+              {onTraceBatch && (
+                <button
+                  onClick={handleTraceBatch}
+                  disabled={resourceBlobs.length === 0 || loadingBlobs}
+                  className="text-xs bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:bg-gray-100 disabled:text-gray-400 px-2 py-1 rounded transition-colors"
+                  title={loadingBlobs ? "Loading blobs…" : resourceBlobs.length === 0 ? "No blobs found for this resource" : `Trace ${resourceBlobs.length} blob(s) from latest batch`}
+                >
+                  {loadingBlobs ? "Loading…" : "Trace latest batch →"}
+                </button>
+              )}
               <button
                 onClick={() => setShowAirflowConfig(!showAirflowConfig)}
                 className={`text-xs px-2 py-1 rounded ${
@@ -914,10 +973,14 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                         </span>
                       )}
                       {!lastRun && <span className="text-xs text-gray-400">not run yet</span>}
+                      {!airflowConfig.base_url && (
+                        <span className="text-xs text-amber-600" title="Configure Airflow REST API first">⚠ REST API</span>
+                      )}
                       <button
                         onClick={() => handleLoadLastRun(dag)}
                         disabled={isBusy}
                         className="text-xs bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
+                        title={!airflowConfig.base_url ? "Configure Airflow REST API first (click Configure button above)" : "Fetch latest run logs via REST API"}
                       >
                         {isLoadingLogs ? "Loading..." : "Load last run"}
                       </button>

@@ -47,26 +47,6 @@ export default function App({ Component, pageProps }: AppProps) {
           </div>
         </div>
 
-        {/* Sidebar */}
-        <div className="ide-sidebar">
-          <div className="ide-sidebar-title">Explorer</div>
-          <div className="ide-sidebar-group">▾ Open Editors</div>
-          <div className="ide-sidebar-file active l1">● dataflow_pipeline.py</div>
-          <div className="ide-sidebar-group">▾ pipeline-debugger</div>
-          <div className="ide-sidebar-file l1">▾ src/</div>
-          <div className="ide-sidebar-file l2 active">● dataflow_pipeline.py</div>
-          <div className="ide-sidebar-file l2">  config.yaml</div>
-          <div className="ide-sidebar-file l2">  utils.py</div>
-          <div className="ide-sidebar-file l2">  models.py</div>
-          <div className="ide-sidebar-file l2">  azure_client.py</div>
-          <div className="ide-sidebar-file l1">▾ tests/</div>
-          <div className="ide-sidebar-file l2">  test_pipeline.py</div>
-          <div className="ide-sidebar-file l2">  test_utils.py</div>
-          <div className="ide-sidebar-file l1">  .env</div>
-          <div className="ide-sidebar-file l1">  requirements.txt</div>
-          <div className="ide-sidebar-file l1">  README.md</div>
-        </div>
-
         {/* Editor */}
         <div className="ide-editor">
           {/* Tabs */}
