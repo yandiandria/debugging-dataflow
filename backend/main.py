@@ -891,7 +891,7 @@ async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse
                                 )
                                 break
 
-                        if log_text:
+                        if log_text and state == "success":
                             yield _log(
                                 f"[{idx}/{len(all_task_instances)}] {task_id}"
                                 f"(map_index={map_index}, try={try_number}, state={state}): "
