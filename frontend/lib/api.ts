@@ -121,6 +121,7 @@ export interface DAGRun {
   status: string;
   stdout?: string;
   stderr?: string;
+  task_logs?: LogEntry[];
 }
 
 // ── Integration Rule types ────────────────────────────────────────────────
@@ -566,6 +567,14 @@ export async function getDagRuns(dagId?: string): Promise<DAGRun[]> {
   const res = await fetch(url);
   if (!res.ok) throw new Error("Failed to load DAG runs");
   return res.json();
+}
+
+export async function updateDagRun(id: string, data: Partial<DAGRun>): Promise<void> {
+  await fetch(`${BASE_URL}/api/dag-runs/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
 }
 
 // ── Resource-DAG linking ────────────────────────────────────────────────────

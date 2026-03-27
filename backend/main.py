@@ -191,6 +191,7 @@ class Resource(BaseModel):
     business_name: str
     created_at: str
     extract_prefixes: List[str] = []
+    dag_ids: List[str] = []
 
 
 class ResourceCreate(BaseModel):
@@ -595,14 +596,14 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
             for task_id in task_ids:
                 if task_id:
                     script = (
-                        f"find /opt/airflow/logs/ -type f -name '*.log'"
-                        f" -path '*{body.dag_id}*' -path '*{task_id}*'"
+                        f"LOGDIR=$(airflow config get-value logging base_log_folder 2>/dev/null || echo '/opt/airflow/logs');"
+                        f" find \"$LOGDIR\" -type f -path '*{body.dag_id}*' -path '*{task_id}*'"
                         f" 2>/dev/null | sort | xargs cat 2>/dev/null"
                     )
                 else:
                     script = (
-                        f"find /opt/airflow/logs/ -type f -name '*.log'"
-                        f" -path '*{body.dag_id}*'"
+                        f"LOGDIR=$(airflow config get-value logging base_log_folder 2>/dev/null || echo '/opt/airflow/logs');"
+                        f" find \"$LOGDIR\" -type f -path '*{body.dag_id}*'"
                         f" 2>/dev/null | sort | xargs cat 2>/dev/null"
                     )
                 cmd = ["docker", "exec", container, "bash", "-c", script]
@@ -681,6 +682,17 @@ async def list_dag_runs(dag_id: Optional[str] = None):
     if dag_id:
         runs = [r for r in runs if r.get("dag_id") == dag_id]
     return runs
+
+
+@app.patch("/api/dag-runs/{run_id}")
+async def update_dag_run(run_id: str, body: Dict):
+    runs = _load_json(DAG_RUNS_FILE)
+    for r in runs:
+        if r["id"] == run_id:
+            r.update(body)
+            _save_json(DAG_RUNS_FILE, runs)
+            return r
+    raise HTTPException(status_code=404, detail="Run not found")
 
 
 # ── Mapping issue parsing & endpoints ─────────────────────────────────────────

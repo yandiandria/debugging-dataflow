@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import LogPanel from "./LogPanel";
 import type { VolumetryEntry } from "./VolumetryPanel";
 import type {
@@ -6,7 +6,7 @@ import type {
   BlobInfo, LogEntry,
 } from "../lib/api";
 import {
-  getDags, getDagConfig, getDagRuns,
+  getDags, getDagConfig, getDagRuns, updateDagRun,
   getRules, updateRule,
   getMappingIssues, saveMappingIssues, resolveMappingIssue,
   getQAExamples, createQAExample, deleteQAExample,
@@ -24,9 +24,22 @@ interface Props {
 }
 
 export default function ResourceDashboard({ resources, blobs, containerUrl, onBack }: Props) {
-  // Selection
-  const [selectedResourceId, setSelectedResourceId] = useState<string>(resources[0]?.id ?? "");
-  const [selectedEnv, setSelectedEnv] = useState("dev");
+  // Selection — persisted across reloads
+  const [selectedResourceId, setSelectedResourceId] = useState<string>(() => {
+    const saved = localStorage.getItem("dashboard_selectedResourceId");
+    return (saved && resources.some((r) => r.id === saved)) ? saved : (resources[0]?.id ?? "");
+  });
+  const [selectedEnv, setSelectedEnv] = useState<string>(
+    () => localStorage.getItem("dashboard_selectedEnv") ?? "dev"
+  );
+
+  useEffect(() => {
+    if (selectedResourceId) localStorage.setItem("dashboard_selectedResourceId", selectedResourceId);
+  }, [selectedResourceId]);
+
+  useEffect(() => {
+    localStorage.setItem("dashboard_selectedEnv", selectedEnv);
+  }, [selectedEnv]);
 
   // Data
   const [dags, setDags] = useState<DAG[]>([]);
@@ -44,6 +57,18 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   // DAG runner
   const [dagLogs, setDagLogs] = useState<LogEntry[]>([]);
   const [runningDagId, setRunningDagId] = useState<string | null>(null);
+  const restoredLogsForRef = useRef<string | null>(null);
+
+  // Restore task logs from most recent run when resource/DAG data loads
+  useEffect(() => {
+    if (restoredLogsForRef.current === selectedResourceId) return;
+    if (resourceDagIds.length === 0 || dagRuns.length === 0) return;
+    restoredLogsForRef.current = selectedResourceId;
+    const recent = dagRuns
+      .filter((r) => resourceDagIds.includes(r.dag_id) && r.task_logs?.length)
+      .sort((a, b) => b.triggered_at.localeCompare(a.triggered_at))[0];
+    setDagLogs(recent?.task_logs ?? []);
+  }, [dagRuns, resourceDagIds, selectedResourceId]);
 
   // Volumetry
   const [volumetryData, setVolumetryData] = useState<Record<string, VolumetryEntry>>({});
@@ -162,19 +187,25 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const handleTriggerDag = async (dag: DAG) => {
     setRunningDagId(dag.dag_id);
     setDagLogs([]);
+    restoredLogsForRef.current = selectedResourceId; // don't overwrite with history while running
+    const collectedLogs: LogEntry[] = [];
+    const addLog = (entry: LogEntry) => {
+      collectedLogs.push(entry);
+      setDagLogs((prev) => [...prev, entry]);
+    };
 
     await triggerDagStream(
       dag.dag_id,
       selectedEnv,
-      (entry) => setDagLogs((prev) => [...prev, entry]),
+      addLog,
       async (result) => {
         setRunningDagId(null);
-        // After trigger, fetch logs for mapping issues
+        // After trigger, fetch task logs for mapping issues
         if (result.run_id) {
           await fetchDagLogsStream(
             dag.dag_id,
             result.run_id,
-            (entry) => setDagLogs((prev) => [...prev, entry]),
+            addLog,
             async (issues) => {
               if (issues.length > 0 && selectedResourceId) {
                 await saveMappingIssues(issues, selectedResourceId, result.record_id);
@@ -182,7 +213,9 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                 setMappingIssues(updated);
               }
             },
-            () => {},
+            async () => {
+              await updateDagRun(result.record_id, { task_logs: collectedLogs });
+            },
             () => {},
             ["load", "update"],
           );
