@@ -663,7 +663,7 @@ export async function fetchDagLogsRestApi(
   const res = await fetch(`${BASE_URL}/api/dags/logs-rest-api`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(config),
+    body: JSON.stringify({ ...config, dag_id }),
   });
 
   if (!res.ok || !res.body) {

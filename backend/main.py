@@ -304,6 +304,7 @@ class AirflowRestAPIConfig(BaseModel):
     base_url: str
     username: str
     password: str
+    dag_id: str
     verify_tls: bool = True
 
 
