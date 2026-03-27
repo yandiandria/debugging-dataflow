@@ -622,10 +622,21 @@ export async function fetchDagLogsStream(
   }
 }
 
-export async function getDagRuns(dagId?: string): Promise<DAGRun[]> {
-  const url = dagId ? `${BASE_URL}/api/dag-runs?dag_id=${encodeURIComponent(dagId)}` : `${BASE_URL}/api/dag-runs`;
-  const res = await fetch(url);
+/** Fetch the run list. By default logs are stripped (fast). Pass includeLogs for full data. */
+export async function getDagRuns(dagId?: string, includeLogs = false): Promise<DAGRun[]> {
+  const params = new URLSearchParams();
+  if (dagId) params.set("dag_id", dagId);
+  if (includeLogs) params.set("include_logs", "true");
+  const qs = params.toString();
+  const res = await fetch(`${BASE_URL}/api/dag-runs${qs ? `?${qs}` : ""}`);
   if (!res.ok) throw new Error("Failed to load DAG runs");
+  return res.json();
+}
+
+/** Fetch a single run with full log data (task_logs, task_sub_logs, etc.). */
+export async function getDagRun(id: string): Promise<DAGRun> {
+  const res = await fetch(`${BASE_URL}/api/dag-runs/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error("Failed to load DAG run");
   return res.json();
 }
 

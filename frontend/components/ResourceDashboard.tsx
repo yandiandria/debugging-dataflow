@@ -6,7 +6,7 @@ import type {
   BlobInfo, LogEntry,
 } from "../lib/api";
 import {
-  getDags, getDagConfig, getDagRuns, updateDagRun,
+  getDags, getDagConfig, getDagRuns, getDagRun, updateDagRun,
   getRules, updateRule,
   getMappingIssues, saveMappingIssues, resolveMappingIssue,
   getQAExamples, createQAExample, deleteQAExample,
@@ -63,27 +63,35 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
 
-  // Restore logs/states from most recent run when resource/DAG data loads
+  // Restore logs/states from most recent run when resource/DAG data loads.
+  // dagRuns is now log-stripped, so we fetch the full run by ID lazily.
   useEffect(() => {
     if (restoredLogsForRef.current === selectedResourceId) return;
     if (resourceDagIds.length === 0 || dagRuns.length === 0) return;
     restoredLogsForRef.current = selectedResourceId;
+
+    // Find the most recent run for this resource (lightweight list is enough for this)
     const recent = dagRuns
-      .filter((r) => resourceDagIds.includes(r.dag_id) && (r.task_logs?.length || r.task_sub_logs?.length))
+      .filter((r) => resourceDagIds.includes(r.dag_id))
       .sort((a, b) => b.triggered_at.localeCompare(a.triggered_at))[0];
     if (!recent) return;
-    setDagLogs(recent.task_logs ?? []);
-    if (recent.task_sub_logs) {
-      const m: Record<string, LogEntry[]> = {};
-      recent.task_sub_logs.forEach(({ task_id, logs }) => { m[task_id] = logs; });
-      setTaskLogs(m);
-    }
-    if (recent.task_final_states) {
-      const m: Record<string, string> = {};
-      recent.task_final_states.forEach(({ task_id, state }) => { m[task_id] = state; });
-      setTaskStates(m);
-      setCollapsedTasks(new Set(recent.task_final_states.map((t) => t.task_id)));
-    }
+
+    // Fetch full run data (with logs) only for this one run
+    getDagRun(recent.id).then((full) => {
+      if (!full.task_logs?.length && !full.task_sub_logs?.length) return;
+      setDagLogs(full.task_logs ?? []);
+      if (full.task_sub_logs) {
+        const m: Record<string, LogEntry[]> = {};
+        full.task_sub_logs.forEach(({ task_id, logs }) => { m[task_id] = logs; });
+        setTaskLogs(m);
+      }
+      if (full.task_final_states) {
+        const m: Record<string, string> = {};
+        full.task_final_states.forEach(({ task_id, state }) => { m[task_id] = state; });
+        setTaskStates(m);
+        setCollapsedTasks(new Set(full.task_final_states.map((t) => t.task_id)));
+      }
+    }).catch(() => {});
   }, [dagRuns, resourceDagIds, selectedResourceId]);
 
   // Volumetry
@@ -105,27 +113,35 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
     return blobs.filter((b) => b.name.startsWith(selectedResource.technical_name));
   }, [selectedResource, blobs]);
 
-  // Load all data
+  // Load data in two phases:
+  // Phase 1 (critical, fast) — getDags + getDagConfig fire first so linkedDags
+  //   renders immediately and never shows "No DAGs linked" while waiting for runs.
+  // Phase 2 (secondary, can be slow) — getDagRuns (potentially large), rules,
+  //   mapping issues, QA examples are loaded after phase 1 completes.
   const loadData = useCallback(async () => {
     try {
-      const [d, dc, runs, r, mi, qa] = await Promise.all([
-        getDags(),
-        getDagConfig(),
-        getDagRuns(),
+      // ── Phase 1: critical data needed to render the DAG runner ──────────
+      const [d, dc] = await Promise.all([getDags(), getDagConfig()]);
+      setDags(d);
+      setDagConfig(dc);
+      if (dc.environments.length > 0 && !dc.environments.includes(selectedEnv)) {
+        setSelectedEnv(dc.environments[0]);
+      }
+    } catch { /* ignore */ }
+
+    try {
+      // ── Phase 2: secondary data (runs list is stripped of logs — lightweight) ──
+      const [runs, r, mi, qa] = await Promise.all([
+        getDagRuns(),   // logs stripped by default — response is tiny now
         getRules(),
         getMappingIssues(selectedResourceId || undefined),
         getQAExamples(selectedResourceId || undefined),
       ]);
-      setDags(d);
-      setDagConfig(dc);
       setDagRuns(runs);
       setRules(r);
       setMappingIssues(mi);
       setQAExamples(qa);
-      if (dc.environments.length > 0 && !dc.environments.includes(selectedEnv)) {
-        setSelectedEnv(dc.environments[0]);
-      }
-    } catch { /* ignore load errors */ }
+    } catch { /* ignore */ }
   }, [selectedResourceId, selectedEnv]);
 
   useEffect(() => {

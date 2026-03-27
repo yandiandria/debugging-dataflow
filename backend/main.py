@@ -660,7 +660,7 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
                             run_id = match.group(1).strip(",").strip("'\"")
                             break
 
-                # Save run record
+                # Save run record, pruning old entries to cap file size
                 runs = _load_json(DAG_RUNS_FILE)
                 run_record = {
                     "id": str(uuid.uuid4()),
@@ -673,6 +673,9 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
                     "stderr": stderr_text,
                 }
                 runs.append(run_record)
+                # Keep only the most recent _MAX_DAG_RUNS entries
+                if len(runs) > _MAX_DAG_RUNS:
+                    runs = runs[-_MAX_DAG_RUNS:]
                 _save_json(DAG_RUNS_FILE, runs)
 
                 yield _log(f"DAG triggered successfully. Run ID: {run_id or 'unknown'}", "success")
@@ -884,12 +887,40 @@ async def list_airflow_dags(force_refresh: bool = False):
 
 # ── DAG run history ───────────────────────────────────────────────────────────
 
+_LOG_KEYS = {"task_logs", "task_sub_logs", "stdout", "stderr"}
+_MAX_DAG_RUNS = 200  # cap to prevent dag_runs.json from growing unbounded
+
+
+def _strip_logs(run: Dict) -> Dict:
+    """Return a copy of a run record with bulky log fields removed."""
+    return {k: v for k, v in run.items() if k not in _LOG_KEYS}
+
+
 @app.get("/api/dag-runs")
-async def list_dag_runs(dag_id: Optional[str] = None):
+async def list_dag_runs(dag_id: Optional[str] = None, include_logs: bool = False):
+    """List DAG runs.
+
+    By default log fields (task_logs, task_sub_logs, stdout, stderr) are
+    stripped from the response to keep it lightweight — the list is used for
+    status/timestamp display only.  Pass ?include_logs=true when you need
+    the full data (e.g. for restoring a previous run's log view).
+    """
     runs = _load_json(DAG_RUNS_FILE)
     if dag_id:
         runs = [r for r in runs if r.get("dag_id") == dag_id]
+    if not include_logs:
+        runs = [_strip_logs(r) for r in runs]
     return runs
+
+
+@app.get("/api/dag-runs/{run_id}")
+async def get_dag_run(run_id: str):
+    """Fetch a single DAG run with full log data."""
+    runs = _load_json(DAG_RUNS_FILE)
+    for r in runs:
+        if r["id"] == run_id:
+            return r
+    raise HTTPException(status_code=404, detail="Run not found")
 
 
 @app.patch("/api/dag-runs/{run_id}")
