@@ -338,10 +338,38 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
         async (taskLogs) => {
           // Update task states from the fetched logs
           const states: Record<string, string> = {};
+          let allLogText = "";
           for (const log of taskLogs) {
             states[log.task_id] = log.state;
+            allLogText += log.logs + "\n";
           }
           setTaskStates(states);
+
+          // Parse mapping issues from loaded logs
+          const mappingIssuePattern = /\} WARNING - Les valeurs (\(.+?\)) \((\d+)\) ne sont pas présentes dans le mapping (.+?)\./g;
+          const foundIssues: Array<{ unmapped_value: string; count: number; column: string }> = [];
+          let match;
+          while ((match = mappingIssuePattern.exec(allLogText)) !== null) {
+            foundIssues.push({
+              unmapped_value: match[1],
+              count: parseInt(match[2]),
+              column: match[3],
+            });
+          }
+
+          // Save mapping issues if any found
+          if (foundIssues.length > 0 && selectedResourceId) {
+            const localRecord = dagRuns.find((r) => r.dag_id === dag.dag_id);
+            if (localRecord) {
+              await saveMappingIssues(foundIssues, selectedResourceId, localRecord.id);
+              const updated = await getMappingIssues(selectedResourceId);
+              setMappingIssues(updated);
+              addLog({ level: "success", message: `Found ${foundIssues.length} mapping issue(s)`, timestamp: new Date().toISOString() });
+            }
+          } else if (foundIssues.length === 0) {
+            addLog({ level: "info", message: "No mapping issues found", timestamp: new Date().toISOString() });
+          }
+
           const runs = await getDagRuns();
           setDagRuns(runs);
         },
@@ -593,7 +621,11 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                 ))}
               </div>
             ) : (
-              <p className="text-sm text-gray-400">No mapping issues found. Run a DAG to check for issues.</p>
+              <p className="text-sm text-gray-400">
+                {dagLogs.length === 0
+                  ? "Load logs first to check for mapping issues."
+                  : "No mapping issues found."}
+              </p>
             )}
           </div>
         </div>
@@ -634,12 +666,30 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                       <span className="text-xs text-gray-400 ml-2">({ex.id_column})</span>
                       <span className="text-xs text-gray-500 ml-2">- {ex.label}</span>
                     </div>
-                    <button
-                      onClick={() => handleDeleteQAExample(ex.id)}
-                      className="text-xs text-gray-400 hover:text-red-500"
-                    >
-                      x
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => {
+                          // Execute QA example: query the data flow for this ID
+                          setDagLogs([]);
+                          setDagLogs((prev) => [
+                            ...prev,
+                            { level: "info", message: `Executing QA example: ${ex.label}`, timestamp: new Date().toISOString() },
+                            { level: "info", message: `Filter: ${ex.id_column} = ${ex.id_value}`, timestamp: new Date().toISOString() },
+                          ]);
+                          // Note: Full query execution would require the same data source (container_url + selected blobs)
+                          // This is a placeholder showing the example details
+                        }}
+                        className="text-xs text-indigo-600 hover:text-indigo-800"
+                      >
+                        Execute
+                      </button>
+                      <button
+                        onClick={() => handleDeleteQAExample(ex.id)}
+                        className="text-xs text-gray-400 hover:text-red-500"
+                      >
+                        x
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
