@@ -695,6 +695,8 @@ export async function fetchDagLogsRestApi(
           // Emit individual task logs
           for (const taskLog of allTaskLogs) {
             if (taskLog.logs) {
+              // Log raw content for debugging
+              console.log(`Task ${taskLog.task_id}: ${taskLog.logs.length} bytes`, taskLog.logs.slice(0, 200));
               onTaskLog(taskLog.task_id, taskLog.logs);
             }
           }
