@@ -3,7 +3,7 @@ import LogPanel from "./LogPanel";
 import type { VolumetryEntry } from "./VolumetryPanel";
 import type {
   Resource, DAG, DAGConfig, DAGRun, IntegrationRule, MappingIssue, QAExampleID,
-  BlobInfo, LogEntry,
+  BlobInfo, LogEntry, AirflowConfig,
 } from "../lib/api";
 import {
   getDags, getDagConfig, getDagRuns, getDagRun, updateDagRun,
@@ -11,7 +11,7 @@ import {
   getMappingIssues, saveMappingIssues, resolveMappingIssue,
   getQAExamples, createQAExample, deleteQAExample,
   getIdColumns, getColumnValues,
-  triggerDagStream, fetchDagLogsStream, getLatestAirflowRunId,
+  triggerDagStream, fetchDagLogsStream, fetchDagLogsRestApi, getLatestAirflowRunId,
   linkResourceDags,
   profileBlobsStream,
 } from "../lib/api";
@@ -63,6 +63,13 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const [loadingLogsForDagId, setLoadingLogsForDagId] = useState<string | null>(null);
   const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
+
+  // Airflow REST API config
+  const [airflowConfig, setAirflowConfig] = useState<AirflowConfig>(() => {
+    const saved = localStorage.getItem("airflow_config");
+    return saved ? JSON.parse(saved) : { base_url: "", username: "", password: "", verify_tls: true };
+  });
+  const [showAirflowConfig, setShowAirflowConfig] = useState(false);
 
   // Restore logs/states from most recent run when resource/DAG data loads.
   // dagRuns is now log-stripped, so we fetch the full run by ID lazily.
@@ -292,38 +299,74 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
     restoredLogsForRef.current = selectedResourceId;
 
     try {
-      const airflowRunId = await getLatestAirflowRunId(dag.dag_id);
-      const localRecord = dagRuns.find((r) => r.dag_id === dag.dag_id && r.run_id === airflowRunId);
-
       const addLog = (entry: LogEntry) => setDagLogs((prev) => [...prev, entry]);
-      const addTaskLog = (taskId: string, entry: LogEntry) =>
-        setTaskLogs((prev) => ({ ...prev, [taskId]: [...(prev[taskId] ?? []), entry] }));
-      const updateStates = (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => {
-        setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
-        if (elapsedS !== undefined) setRunElapsedS(elapsedS);
-      };
 
-      await fetchDagLogsStream(
-        dag.dag_id,
-        airflowRunId,
-        addLog,
-        addTaskLog,
-        updateStates,
-        async (issues) => {
-          if (issues.length > 0 && selectedResourceId && localRecord) {
-            await saveMappingIssues(issues, selectedResourceId, localRecord.id);
-            const updated = await getMappingIssues(selectedResourceId);
-            setMappingIssues(updated);
-          }
-        },
-        async () => {
-          const runs = await getDagRuns();
-          setDagRuns(runs);
-        },
-        (message) => {
-          setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
-        },
-      );
+      // Use REST API if Airflow config is complete
+      if (airflowConfig.base_url && airflowConfig.username && airflowConfig.password) {
+        await fetchDagLogsRestApi(
+          airflowConfig,
+          dag.dag_id,
+          addLog,
+          (taskId: string, logs: string) => {
+            setTaskLogs((prev) => {
+              const taskEntries = logs.split("\n")
+                .filter((l) => l.trim())
+                .map((line) => ({
+                  level: "info" as const,
+                  message: line,
+                  timestamp: new Date().toISOString(),
+                }));
+              return { ...prev, [taskId]: taskEntries };
+            });
+          },
+          async (taskLogs) => {
+            // Update task states from the fetched logs
+            const states: Record<string, string> = {};
+            for (const log of taskLogs) {
+              states[log.task_id] = log.state;
+            }
+            setTaskStates(states);
+            const runs = await getDagRuns();
+            setDagRuns(runs);
+          },
+          (message) => {
+            setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
+          },
+        );
+      } else {
+        // Fallback to old Docker-based method
+        const airflowRunId = await getLatestAirflowRunId(dag.dag_id);
+        const localRecord = dagRuns.find((r) => r.dag_id === dag.dag_id && r.run_id === airflowRunId);
+
+        const addTaskLog = (taskId: string, entry: LogEntry) =>
+          setTaskLogs((prev) => ({ ...prev, [taskId]: [...(prev[taskId] ?? []), entry] }));
+        const updateStates = (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => {
+          setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
+          if (elapsedS !== undefined) setRunElapsedS(elapsedS);
+        };
+
+        await fetchDagLogsStream(
+          dag.dag_id,
+          airflowRunId,
+          addLog,
+          addTaskLog,
+          updateStates,
+          async (issues) => {
+            if (issues.length > 0 && selectedResourceId && localRecord) {
+              await saveMappingIssues(issues, selectedResourceId, localRecord.id);
+              const updated = await getMappingIssues(selectedResourceId);
+              setMappingIssues(updated);
+            }
+          },
+          async () => {
+            const runs = await getDagRuns();
+            setDagRuns(runs);
+          },
+          (message) => {
+            setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
+          },
+        );
+      }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       setDagLogs((prev) => [...prev, { level: "error", message, timestamp: new Date().toISOString() }]);
@@ -709,14 +752,25 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                 </span>
               )}
             </h3>
-            <div className="relative">
+            <div className="flex items-center gap-2">
               <button
-                onClick={() => setShowDagLinkDropdown(!showDagLinkDropdown)}
-                disabled={linkingDags}
-                className="text-xs text-indigo-600 hover:text-indigo-800"
+                onClick={() => setShowAirflowConfig(!showAirflowConfig)}
+                className={`text-xs px-2 py-1 rounded ${
+                  airflowConfig.base_url && airflowConfig.username && airflowConfig.password
+                    ? "bg-green-100 text-green-700 hover:bg-green-200"
+                    : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                }`}
               >
-                {linkingDags ? "Saving..." : "Link DAGs"}
+                {airflowConfig.base_url ? "✓ REST API" : "Configure"}
               </button>
+              <div className="relative">
+                <button
+                  onClick={() => setShowDagLinkDropdown(!showDagLinkDropdown)}
+                  disabled={linkingDags}
+                  className="text-xs text-indigo-600 hover:text-indigo-800"
+                >
+                  {linkingDags ? "Saving..." : "Link DAGs"}
+                </button>
               {showDagLinkDropdown && (
                 <div className="absolute right-0 top-6 z-10 bg-white border border-gray-200 rounded-lg shadow-lg p-2 min-w-[200px]">
                   {dags.length === 0 && <p className="text-xs text-gray-400 p-2">No DAGs defined. Add them in DAG Manager.</p>}
@@ -740,8 +794,70 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                   </button>
                 </div>
               )}
+              </div>
             </div>
           </div>
+
+          {/* Airflow REST API Config */}
+          {showAirflowConfig && (
+            <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+              <p className="text-xs text-blue-700 mb-2">Airflow REST API Configuration</p>
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  placeholder="Base URL (e.g., http://localhost:8888)"
+                  value={airflowConfig.base_url}
+                  onChange={(e) => {
+                    const updated = { ...airflowConfig, base_url: e.target.value };
+                    setAirflowConfig(updated);
+                    localStorage.setItem("airflow_config", JSON.stringify(updated));
+                  }}
+                  className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                />
+                <input
+                  type="text"
+                  placeholder="Username"
+                  value={airflowConfig.username}
+                  onChange={(e) => {
+                    const updated = { ...airflowConfig, username: e.target.value };
+                    setAirflowConfig(updated);
+                    localStorage.setItem("airflow_config", JSON.stringify(updated));
+                  }}
+                  className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                />
+                <input
+                  type="password"
+                  placeholder="Password"
+                  value={airflowConfig.password}
+                  onChange={(e) => {
+                    const updated = { ...airflowConfig, password: e.target.value };
+                    setAirflowConfig(updated);
+                    localStorage.setItem("airflow_config", JSON.stringify(updated));
+                  }}
+                  className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                />
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={airflowConfig.verify_tls !== false}
+                    onChange={(e) => {
+                      const updated = { ...airflowConfig, verify_tls: e.target.checked };
+                      setAirflowConfig(updated);
+                      localStorage.setItem("airflow_config", JSON.stringify(updated));
+                    }}
+                    className="rounded border-gray-300"
+                  />
+                  <span className="text-gray-600">Verify TLS</span>
+                </label>
+                <button
+                  onClick={() => setShowAirflowConfig(false)}
+                  className="w-full text-xs bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded"
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          )}
 
           {linkedDags.length > 0 ? (
             <div className="space-y-2">

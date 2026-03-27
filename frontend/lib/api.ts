@@ -632,6 +632,81 @@ export async function fetchDagLogsStream(
   }
 }
 
+export interface AirflowConfig {
+  base_url: string;
+  username: string;
+  password: string;
+  verify_tls?: boolean;
+}
+
+export interface TaskLog {
+  task_id: string;
+  map_index: number;
+  try_number: number;
+  state: string;
+  logs: string;
+  status: "success" | "not_found" | string;
+}
+
+/**
+ * Fetch Airflow task logs using the REST API.
+ * Calls onLog for progress messages, onTaskLog for each task's logs, onDone when complete.
+ */
+export async function fetchDagLogsRestApi(
+  config: AirflowConfig,
+  dag_id: string,
+  onLog: (entry: LogEntry) => void,
+  onTaskLog: (taskId: string, logs: string) => void,
+  onDone: (taskLogs: TaskLog[]) => void | Promise<void>,
+  onError: (message: string) => void,
+): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/dags/logs-rest-api`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+
+  if (!res.ok || !res.body) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    onError(err.detail || "Failed to fetch DAG logs");
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let allTaskLogs: TaskLog[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const event = JSON.parse(line.slice(6));
+        const ts = new Date().toISOString();
+        if (event.type === "log") {
+          onLog({ level: event.level ?? "info", message: event.message, timestamp: ts });
+        } else if (event.type === "done") {
+          allTaskLogs = event.logs ?? [];
+          // Emit individual task logs
+          for (const taskLog of allTaskLogs) {
+            if (taskLog.logs) {
+              onTaskLog(taskLog.task_id, taskLog.logs);
+            }
+          }
+          await onDone(allTaskLogs);
+        } else if (event.type === "error") {
+          onError(event.message);
+        }
+      } catch { /* ignore */ }
+    }
+  }
+}
+
 /** Fetch the run list. By default logs are stripped (fast). Pass includeLogs for full data. */
 export async function getDagRuns(dagId?: string, includeLogs = false): Promise<DAGRun[]> {
   const params = new URLSearchParams();
