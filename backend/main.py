@@ -593,10 +593,19 @@ async def get_dag_logs(body: DAGLogRequest) -> StreamingResponse:
 
         try:
             for task_id in task_ids:
-                cmd = ["docker", "exec", container, "airflow", "tasks", "logs", body.dag_id]
                 if task_id:
-                    cmd.append(task_id)
-                cmd.append(body.run_id)
+                    script = (
+                        f"find /opt/airflow/logs/ -type f -name '*.log'"
+                        f" -path '*{body.dag_id}*' -path '*{task_id}*'"
+                        f" 2>/dev/null | sort | xargs cat 2>/dev/null"
+                    )
+                else:
+                    script = (
+                        f"find /opt/airflow/logs/ -type f -name '*.log'"
+                        f" -path '*{body.dag_id}*'"
+                        f" 2>/dev/null | sort | xargs cat 2>/dev/null"
+                    )
+                cmd = ["docker", "exec", container, "bash", "-c", script]
 
                 if task_id:
                     yield _log(f"── task: {task_id} ──", "info")
