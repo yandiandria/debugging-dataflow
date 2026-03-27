@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -1191,11 +1192,51 @@ async def get_column_values_v2(request: ColumnValuesRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Only sample from clean_cleaned blobs
+    cleaned_blobs = [b for b in request.blob_names if detect_stage(b) == "clean_cleaned"]
+
     all_values: set = set()
-    for blob_name in request.blob_names:
+    for blob_name in cleaned_blobs:
         try:
-            raw = client.get_blob_client(blob_name).download_blob().readall()
-            df = pd.read_csv(io.BytesIO(raw))
+            # Stream lines and reservoir-sample 10 data rows (avoids loading full file)
+            stream = client.get_blob_client(blob_name).download_blob()
+            lines: list[bytes] = []
+            header: bytes | None = None
+            reservoir: list[bytes] = []
+            n_seen = 0
+            for chunk in stream.chunks():
+                lines.extend(chunk.splitlines(keepends=True))
+                # Process complete lines (keep last partial line for next iteration)
+                complete, lines = lines[:-1], lines[-1:]
+                for line in complete:
+                    if header is None:
+                        header = line
+                        continue
+                    n_seen += 1
+                    if len(reservoir) < 10:
+                        reservoir.append(line)
+                    else:
+                        j = random.randint(0, n_seen - 1)
+                        if j < 10:
+                            reservoir[j] = line
+            # Handle any remaining partial line
+            if lines and lines[0]:
+                line = lines[0]
+                if header is None:
+                    header = line
+                else:
+                    n_seen += 1
+                    if len(reservoir) < 10:
+                        reservoir.append(line)
+                    else:
+                        j = random.randint(0, n_seen - 1)
+                        if j < 10:
+                            reservoir[j] = line
+
+            if header is None or not reservoir:
+                continue
+            sample_bytes = header + b"".join(reservoir)
+            df = pd.read_csv(io.BytesIO(sample_bytes), low_memory=False)
             if request.column in df.columns:
                 vals = df[request.column].dropna().astype(str).unique()
                 all_values.update(vals)
