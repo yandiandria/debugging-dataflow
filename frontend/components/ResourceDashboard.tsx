@@ -21,9 +21,12 @@ interface Props {
   blobs: BlobInfo[];
   containerUrl: string;
   onBack: () => void;
+  /** Called when the user clicks "Trace" on a QA example.
+   *  The parent navigates to the analysis config step pre-filled for this record. */
+  onAnalyzeExample?: (resource: Resource, blobNames: string[], idColumn: string, idValue: string) => void;
 }
 
-export default function ResourceDashboard({ resources, blobs, containerUrl, onBack }: Props) {
+export default function ResourceDashboard({ resources, blobs, containerUrl, onBack, onAnalyzeExample }: Props) {
   // Selection — persisted across reloads
   const [selectedResourceId, setSelectedResourceId] = useState<string>(() => {
     const saved = localStorage.getItem("dashboard_selectedResourceId");
@@ -681,18 +684,36 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
             {qaExamples.length > 0 && (
               <div className="space-y-1 mb-3">
                 {qaExamples.map((ex) => (
-                  <div key={ex.id} className="flex items-center justify-between py-1">
+                  <div key={ex.id} className="flex items-center justify-between py-1 group">
                     <div>
                       <span className="text-sm font-mono text-gray-800">{ex.id_value}</span>
                       <span className="text-xs text-gray-400 ml-2">({ex.id_column})</span>
-                      <span className="text-xs text-gray-500 ml-2">- {ex.label}</span>
+                      <span className="text-xs text-gray-500 ml-2">— {ex.label}</span>
                     </div>
-                    <button
-                      onClick={() => handleDeleteQAExample(ex.id)}
-                      className="text-xs text-gray-400 hover:text-red-500"
-                    >
-                      x
-                    </button>
+                    <div className="flex items-center gap-2">
+                      {onAnalyzeExample && (
+                        <button
+                          onClick={() => onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), ex.id_column, ex.id_value)}
+                          disabled={resourceBlobs.length === 0 || !containerUrl}
+                          title={
+                            !containerUrl
+                              ? "Connect to a container first to trace this record"
+                              : resourceBlobs.length === 0
+                              ? "No blobs matched for this resource"
+                              : `Trace ${ex.id_column} = ${ex.id_value} through all pipeline stages`
+                          }
+                          className="text-xs text-indigo-600 hover:text-indigo-800 disabled:text-gray-300 border border-indigo-200 hover:border-indigo-400 disabled:border-gray-200 px-2 py-0.5 rounded font-medium transition-colors"
+                        >
+                          Trace →
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleDeleteQAExample(ex.id)}
+                        className="text-xs text-gray-300 hover:text-red-500 transition-colors"
+                      >
+                        ×
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
