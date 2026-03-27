@@ -14,19 +14,20 @@ import {
   triggerDagStream, fetchDagLogsRestApi,
   linkResourceDags,
   profileBlobsStream,
+  getResourceBlobs,
 } from "../lib/api";
 
 interface Props {
   resources: Resource[];
-  blobs: BlobInfo[];
   containerUrl: string;
   onBack: () => void;
-  /** Called when the user clicks "Trace" on a QA example.
-   *  The parent navigates to the analysis config step pre-filled for this record. */
+  /** Called when the user clicks "Trace" on a QA example. */
   onAnalyzeExample?: (resource: Resource, blobNames: string[], idColumn: string, idValue: string) => void;
+  /** Called when the user clicks "Trace latest batch" — passes the blob names of the latest batch. */
+  onTraceBatch?: (blobNames: string[]) => void;
 }
 
-export default function ResourceDashboard({ resources, blobs, containerUrl, onBack, onAnalyzeExample }: Props) {
+export default function ResourceDashboard({ resources, containerUrl, onBack, onAnalyzeExample, onTraceBatch }: Props) {
   // Selection — persisted across reloads
   const [selectedResourceId, setSelectedResourceId] = useState<string>(() => {
     const saved = localStorage.getItem("dashboard_selectedResourceId");
@@ -140,10 +141,18 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
 
   const selectedResource = resources.find((r) => r.id === selectedResourceId);
 
-  const resourceBlobs = useMemo(() => {
-    if (!selectedResource) return [];
-    return blobs.filter((b) => b.name.startsWith(selectedResource.technical_name));
-  }, [selectedResource, blobs]);
+  // Lazily fetch blobs for the selected resource from the backend
+  const [resourceBlobs, setResourceBlobs] = useState<BlobInfo[]>([]);
+  const [loadingBlobs, setLoadingBlobs] = useState(false);
+
+  useEffect(() => {
+    if (!selectedResource || !containerUrl) { setResourceBlobs([]); return; }
+    setLoadingBlobs(true);
+    getResourceBlobs(selectedResource.id, containerUrl)
+      .then(setResourceBlobs)
+      .catch(() => setResourceBlobs([]))
+      .finally(() => setLoadingBlobs(false));
+  }, [selectedResource?.id, containerUrl]);
 
   // Load data in two phases:
   // Phase 1 (critical, fast) — getDags + getDagConfig fire first so linkedDags
@@ -241,6 +250,22 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
         }));
       },
     );
+  };
+
+  // Trace latest batch — detects the last gap > GAP_MINUTES and selects blobs after it
+  const handleTraceBatch = () => {
+    if (!onTraceBatch || resourceBlobs.length === 0) return;
+    const GAP_MINUTES = 15;
+    const sorted = [...resourceBlobs]
+      .filter((b) => b.last_modified)
+      .sort((a, b) => a.last_modified.localeCompare(b.last_modified));
+    let batchStartIndex = 0;
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = new Date(sorted[i - 1].last_modified).getTime();
+      const curr = new Date(sorted[i].last_modified).getTime();
+      if ((curr - prev) / (1000 * 60) > GAP_MINUTES) batchStartIndex = i;
+    }
+    onTraceBatch(sorted.slice(batchStartIndex).map((b) => b.name));
   };
 
   // DAG runner
@@ -809,6 +834,16 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
               )}
             </h3>
             <div className="flex items-center gap-2">
+              {onTraceBatch && (
+                <button
+                  onClick={handleTraceBatch}
+                  disabled={resourceBlobs.length === 0 || loadingBlobs}
+                  className="text-xs bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:bg-gray-100 disabled:text-gray-400 px-2 py-1 rounded transition-colors"
+                  title={loadingBlobs ? "Loading blobs…" : resourceBlobs.length === 0 ? "No blobs found for this resource" : `Trace ${resourceBlobs.length} blob(s) from latest batch`}
+                >
+                  {loadingBlobs ? "Loading…" : "Trace latest batch →"}
+                </button>
+              )}
               <button
                 onClick={() => setShowAirflowConfig(!showAirflowConfig)}
                 className={`text-xs px-2 py-1 rounded ${

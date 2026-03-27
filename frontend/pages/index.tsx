@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import ConnectionForm from "../components/ConnectionForm";
 import FileBrowser from "../components/FileBrowser";
 import AnalysisConfig from "../components/AnalysisConfig";
@@ -43,7 +43,9 @@ function detectBatchStart(matchingBlobs: BlobInfo[]): string {
 
 export default function Home() {
   const [step, setStep] = useState<Step>("connect");
-  const [containerUrl, setContainerUrl] = useState("");
+  const [containerUrl, setContainerUrl] = useState(
+    () => localStorage.getItem("dataflow_container_url") ?? ""
+  );
   const [blobs, setBlobs] = useState<BlobInfo[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<AnalyzeResultFull | null>(null);
@@ -113,6 +115,14 @@ export default function Home() {
   useEffect(() => {
     getResources().then(setResources).catch(() => {});
   }, []);
+
+  // Auto-navigate to dashboard on first load when saved containerUrl + resources are available
+  const hasAutoNavigated = useRef(false);
+  useEffect(() => {
+    if (hasAutoNavigated.current || resources.length === 0 || !containerUrl) return;
+    hasAutoNavigated.current = true;
+    setStep("dashboard");
+  }, [resources, containerUrl]);
 
   const refreshResources = () => getResources().then(setResources).catch(() => {});
 
@@ -312,6 +322,18 @@ export default function Home() {
     setStep("config");
   };
 
+  // ── Trace latest batch ────────────────────────────────────────────────────
+  // Called from ResourceDashboard when the user clicks "Trace latest batch".
+  // Pre-selects the detected batch blobs and navigates to the config step.
+  const handleTraceBatch = (blobNames: string[]) => {
+    setSelected(new Set(blobNames));
+    setResult(null);
+    setLogs([]);
+    setError(null);
+    setInitialConfig(undefined);
+    setStep("config");
+  };
+
   const handleLoadHistoryResult = (data: AnalyzeResultFull) => {
     setResult(data);
     setStep("results");
@@ -369,10 +391,10 @@ export default function Home() {
     content = (
       <ResourceDashboard
         resources={resources}
-        blobs={blobs}
         containerUrl={containerUrl}
         onBack={() => setStep("browse")}
         onAnalyzeExample={handleAnalyzeQAExample}
+        onTraceBatch={handleTraceBatch}
       />
     );
   } else if (step === "browse") {

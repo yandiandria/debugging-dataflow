@@ -201,6 +201,23 @@ export async function deleteResource(id: string): Promise<void> {
   }
 }
 
+export async function getResourceBlobs(
+  resourceId: string,
+  containerUrl: string,
+  dateFrom?: string,
+  dateTo?: string,
+): Promise<BlobInfo[]> {
+  const params = new URLSearchParams({ container_url: containerUrl });
+  if (dateFrom) params.set("date_from", dateFrom);
+  if (dateTo) params.set("date_to", dateTo);
+  const res = await fetch(`${BASE_URL}/api/resources/${resourceId}/blobs?${params}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to load resource blobs");
+  }
+  return res.json();
+}
+
 export interface BlobPreview {
   columns: string[];
   rows: Record<string, unknown>[];
@@ -348,7 +365,8 @@ export async function analyzeStream(
   },
   onLog: (entry: LogEntry) => void,
   onResult: (result: AnalyzeResultFull) => void,
-  onError: (message: string) => void
+  onError: (message: string) => void,
+  onStageResult?: (stage: string, rowCount: number) => void,
 ): Promise<void> {
   const res = await fetch(`${BASE_URL}/api/analyze`, {
     method: "POST",
@@ -384,6 +402,8 @@ export async function analyzeStream(
             message: event.message,
             timestamp: new Date().toISOString(),
           });
+        } else if (event.type === "stage_result") {
+          onStageResult?.(event.stage, event.row_count);
         } else if (event.type === "result") {
           onResult({
             ...event.data,
