@@ -26,8 +26,9 @@ from fastapi.responses import StreamingResponse
 from notion_client import AsyncClient as NotionAsyncClient
 from pydantic import BaseModel
 
-BLOB_CACHE_DIR = Path(".cache/dataflow/blobs")
-HISTORY_DIR = Path(".data/history")
+# Resolved after DATA_DIR is set below — see the DATA_DIR block.
+
+_MAX_DAG_RUNS = 200  # cap dag_runs.json from growing unbounded
 
 # Pipeline stage order (most specific names first for detection; order reflects pipeline flow)
 STAGE_ORDER = [
@@ -97,6 +98,11 @@ _AIRFLOW_DAGS_CACHE_TTL = 300  # seconds
 DATA_DIR = Path(os.environ.get("DATAFLOW_DATA_DIR", "")).expanduser() if os.environ.get("DATAFLOW_DATA_DIR") else Path(__file__).parent
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# These live inside DATA_DIR so they survive on Docker volumes when
+# DATAFLOW_DATA_DIR is set (previously they were hardcoded relative paths).
+BLOB_CACHE_DIR = DATA_DIR / ".cache" / "dataflow" / "blobs"
+HISTORY_DIR = DATA_DIR / "history"
+
 RESOURCES_FILE = DATA_DIR / "resources.json"
 DAGS_FILE = DATA_DIR / "dags.json"
 DAG_CONFIG_FILE = DATA_DIR / "dag_config.json"
@@ -114,7 +120,11 @@ def _load_json(path: Path) -> List[Dict]:
 
 
 def _save_json(path: Path, data: List[Dict]) -> None:
-    path.write_text(json.dumps(data, indent=2))
+    # Write to a sibling .tmp file then rename so a crash mid-write never
+    # leaves a corrupted JSON file behind (rename is atomic on POSIX).
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
 
 
 def _load_resources() -> List[Dict]:
@@ -132,7 +142,9 @@ def _load_dag_config() -> Dict:
 
 
 def _save_dag_config(config: Dict) -> None:
-    DAG_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    tmp = DAG_CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    tmp.replace(DAG_CONFIG_FILE)
 
 
 def _load_notion_config() -> Dict:
@@ -142,7 +154,9 @@ def _load_notion_config() -> Dict:
 
 
 def _save_notion_config(config: Dict) -> None:
-    NOTION_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    tmp = NOTION_CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2))
+    tmp.replace(NOTION_CONFIG_FILE)
 
 
 # Notion property types that can be written via the API
@@ -553,7 +567,7 @@ async def import_config(body: ConfigImportBody):
     if body.dags is not None:
         _save_json(DAGS_FILE, body.dags); written.append("dags")
     if body.dag_config is not None:
-        DAG_CONFIG_FILE.write_text(json.dumps(body.dag_config, indent=2)); written.append("dag_config")
+        _save_dag_config(body.dag_config); written.append("dag_config")
     if body.rules is not None:
         _save_json(RULES_FILE, body.rules); written.append("rules")
     if body.mapping_issues is not None:
@@ -707,6 +721,48 @@ async def trigger_dag(body: DAGRunRequest) -> StreamingResponse:
     )
 
 
+async def _fetch_single_task_log(
+    client: httpx.AsyncClient,
+    auth_header: str,
+    log_url: str,
+    params: Dict,
+    task_id: str,
+    map_index: int,
+    try_number: int,
+    state: str,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """Fetch log for a single task instance, with retry on 404 (log not yet available)."""
+    log_text = ""
+    log_status = "not_found"
+    for attempt in range(max_retries):
+        try:
+            log_resp = await client.get(log_url, params=params, headers={"Authorization": auth_header})
+            if log_resp.status_code == 200:
+                log_text = log_resp.text
+                log_status = "success"
+                break
+            elif log_resp.status_code == 404:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                else:
+                    log_status = "not_found"
+            else:
+                log_status = f"error_{log_resp.status_code}"
+                break
+        except Exception:
+            log_status = "exception"
+            break
+    return {
+        "task_id": task_id,
+        "map_index": map_index,
+        "try_number": try_number,
+        "state": state,
+        "logs": log_text,
+        "status": log_status,
+    }
+
+
 @app.post("/api/dags/logs-rest-api")
 async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse:
     """Fetch Airflow logs using the REST API instead of Docker/filesystem.
@@ -828,100 +884,36 @@ async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse
 
                 yield _log(f"Total task instances: {len(all_task_instances)}", "success")
 
-                # Step 3: Fetch logs for each task instance
-                yield _log(f"Fetching logs for {len(all_task_instances)} task instance(s)...", "info")
+                # Step 3: Fetch all task logs concurrently (previously sequential,
+                # which caused up to N * 3 * 2s wait for N tasks with 404 retries).
+                yield _log(f"Fetching logs for {len(all_task_instances)} task instance(s) concurrently...", "info")
 
-                all_logs: List[Dict[str, Any]] = []
-
-                for idx, ti in enumerate(all_task_instances, 1):
+                fetch_coros = []
+                for ti in all_task_instances:
                     task_id = ti.get("task_id", "")
                     try_number = ti.get("try_number", 1)
                     map_index = ti.get("map_index", -1)
-                    state = ti.get("state", "unknown")
-
                     task_id_encoded = quote(task_id, safe="")
-
-                    # Build log URL
                     log_url = (
                         f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns/{run_id_encoded}/"
                         f"taskInstances/{task_id_encoded}/logs/{try_number}"
                     )
-
-                    # Add map_index if this is a mapped task
-                    params = {}
+                    params: Dict = {}
                     if map_index >= 0:
                         params["map_index"] = str(map_index)
+                    fetch_coros.append(_fetch_single_task_log(
+                        client, auth_header, log_url, params,
+                        task_id, map_index, try_number, ti.get("state", "unknown"),
+                    ))
 
-                    try:
-                        log_text = ""
-                        log_status = "not_found"
-                        max_retries = 3
+                all_logs: List[Dict[str, Any]] = list(await asyncio.gather(*fetch_coros))
 
-                        # Retry logic for 404s (logs not ready yet)
-                        for attempt in range(max_retries):
-                            log_resp = await client.get(
-                                log_url,
-                                params=params,
-                                headers={"Authorization": auth_header}
-                            )
+                # Surface any tasks that had errors
+                for log_entry in all_logs:
+                    if log_entry["status"] not in ("success", "not_found"):
+                        yield _log(f"Task {log_entry['task_id']}: {log_entry['status']}", "warning")
 
-                            if log_resp.status_code == 200:
-                                log_text = log_resp.text
-                                log_status = "success"
-                                break
-                            elif log_resp.status_code == 404:
-                                # Logs not ready, wait and retry
-                                if attempt < max_retries - 1:
-                                    yield _log(
-                                        f"[{idx}/{len(all_task_instances)}] {task_id}: Logs not ready, retrying... ({attempt + 1}/{max_retries})",
-                                        "info"
-                                    )
-                                    await asyncio.sleep(2)  # Wait 2 seconds before retry
-                                else:
-                                    log_status = "not_found"
-                                    yield _log(
-                                        f"[{idx}/{len(all_task_instances)}] {task_id}: No logs available after {max_retries} attempts",
-                                        "warning"
-                                    )
-                            else:
-                                log_status = f"error_{log_resp.status_code}"
-                                yield _log(
-                                    f"[{idx}/{len(all_task_instances)}] {task_id}: HTTP {log_resp.status_code}",
-                                    "warning"
-                                )
-                                break
-
-                        if log_text and state == "success":
-                            yield _log(
-                                f"[{idx}/{len(all_task_instances)}] {task_id}"
-                                f"(map_index={map_index}, try={try_number}, state={state}): "
-                                f"{len(log_text)} bytes",
-                                "success"
-                            )
-
-                        all_logs.append({
-                            "task_id": task_id,
-                            "map_index": map_index,
-                            "try_number": try_number,
-                            "state": state,
-                            "logs": log_text,
-                            "status": log_status
-                        })
-                    except Exception as e:
-                        yield _log(
-                            f"[{idx}/{len(all_task_instances)}] {task_id}: Exception: {e}",
-                            "error"
-                        )
-                        all_logs.append({
-                            "task_id": task_id,
-                            "map_index": map_index,
-                            "try_number": try_number,
-                            "state": state,
-                            "logs": "",
-                            "status": "exception"
-                        })
-
-                yield _log(f"Log fetching complete", "success")
+                yield _log("Log fetching complete", "success")
                 yield _sse({
                     "type": "done",
                     "dag_id": body.dag_id,
@@ -996,7 +988,6 @@ async def list_airflow_dags(force_refresh: bool = False):
 # ── DAG run history ───────────────────────────────────────────────────────────
 
 _LOG_KEYS = {"task_logs", "task_sub_logs", "stdout", "stderr"}
-_MAX_DAG_RUNS = 200  # cap to prevent dag_runs.json from growing unbounded
 
 
 def _strip_logs(run: Dict) -> Dict:

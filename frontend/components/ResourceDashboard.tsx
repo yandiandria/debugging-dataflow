@@ -63,6 +63,27 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
   const [loadingLogsForDagId, setLoadingLogsForDagId] = useState<string | null>(null);
   const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
+  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Tick elapsed time while a DAG is running
+  useEffect(() => {
+    if (runningDagId !== null) {
+      elapsedTimerRef.current = setInterval(() => {
+        setRunElapsedS((prev) => prev + 1);
+      }, 1000);
+    } else {
+      if (elapsedTimerRef.current !== null) {
+        clearInterval(elapsedTimerRef.current);
+        elapsedTimerRef.current = null;
+      }
+    }
+    return () => {
+      if (elapsedTimerRef.current !== null) {
+        clearInterval(elapsedTimerRef.current);
+        elapsedTimerRef.current = null;
+      }
+    };
+  }, [runningDagId]);
 
   // Airflow REST API config
   const [airflowConfig, setAirflowConfig] = useState<AirflowConfig>(() => {
@@ -666,30 +687,12 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                       <span className="text-xs text-gray-400 ml-2">({ex.id_column})</span>
                       <span className="text-xs text-gray-500 ml-2">- {ex.label}</span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => {
-                          // Execute QA example: query the data flow for this ID
-                          setDagLogs([]);
-                          setDagLogs((prev) => [
-                            ...prev,
-                            { level: "info", message: `Executing QA example: ${ex.label}`, timestamp: new Date().toISOString() },
-                            { level: "info", message: `Filter: ${ex.id_column} = ${ex.id_value}`, timestamp: new Date().toISOString() },
-                          ]);
-                          // Note: Full query execution would require the same data source (container_url + selected blobs)
-                          // This is a placeholder showing the example details
-                        }}
-                        className="text-xs text-indigo-600 hover:text-indigo-800"
-                      >
-                        Execute
-                      </button>
-                      <button
-                        onClick={() => handleDeleteQAExample(ex.id)}
-                        className="text-xs text-gray-400 hover:text-red-500"
-                      >
-                        x
-                      </button>
-                    </div>
+                    <button
+                      onClick={() => handleDeleteQAExample(ex.id)}
+                      className="text-xs text-gray-400 hover:text-red-500"
+                    >
+                      x
+                    </button>
                   </div>
                 ))}
               </div>
@@ -914,10 +917,14 @@ export default function ResourceDashboard({ resources, blobs, containerUrl, onBa
                         </span>
                       )}
                       {!lastRun && <span className="text-xs text-gray-400">not run yet</span>}
+                      {!airflowConfig.base_url && (
+                        <span className="text-xs text-amber-600" title="Configure Airflow REST API first">⚠ REST API</span>
+                      )}
                       <button
                         onClick={() => handleLoadLastRun(dag)}
                         disabled={isBusy}
                         className="text-xs bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
+                        title={!airflowConfig.base_url ? "Configure Airflow REST API first (click Configure button above)" : "Fetch latest run logs via REST API"}
                       >
                         {isLoadingLogs ? "Loading..." : "Load last run"}
                       </button>

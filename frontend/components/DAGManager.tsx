@@ -126,11 +126,6 @@ export default function DAGManager({ onBack }: Props) {
     fetchAirflowDags();
   }, [fetchAirflowDags]);
 
-  const refresh = async () => {
-    const d = await getDags();
-    setDags(d);
-  };
-
   const handleCreate = async () => {
     if (!newDagId.trim() || !newDisplayName.trim()) return;
     setSaving(true);
@@ -141,7 +136,6 @@ export default function DAGManager({ onBack }: Props) {
       setNewDagId("");
       setNewDisplayName("");
       setShowNew(false);
-      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Create failed");
     } finally {
@@ -157,7 +151,6 @@ export default function DAGManager({ onBack }: Props) {
       const updated = await updateDag(editState.id, editState.dag_id.trim(), editState.display_name.trim());
       setDags((prev) => prev.map((d) => (d.id === updated.id ? updated : d)));
       setEditState(null);
-      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Save failed");
     } finally {
@@ -171,7 +164,6 @@ export default function DAGManager({ onBack }: Props) {
     try {
       await deleteDag(id);
       setDags((prev) => prev.filter((d) => d.id !== id));
-      refresh().catch(() => {});
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Delete failed");
     } finally {

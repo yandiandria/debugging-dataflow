@@ -577,61 +577,6 @@ export async function getLatestAirflowRunId(dagId: string): Promise<string> {
   return data.run_id as string;
 }
 
-export async function fetchDagLogsStream(
-  dag_id: string,
-  run_id: string,
-  onLog: (entry: LogEntry) => void,
-  onTaskLog: (taskId: string, entry: LogEntry) => void,
-  onTaskStates: (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => void,
-  onMappingIssues: (issues: Array<{ unmapped_value: string; count?: number; column: string }>) => void,
-  onDone: () => void | Promise<void>,
-  onError: (message: string) => void,
-): Promise<void> {
-  const res = await fetch(`${BASE_URL}/api/dags/logs`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dag_id, run_id, task_ids: [] }),
-  });
-
-  if (!res.ok || !res.body) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    onError(err.detail || "Failed to fetch DAG logs");
-    return;
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      try {
-        const event = JSON.parse(line.slice(6));
-        const ts = new Date().toISOString();
-        if (event.type === "log") {
-          onLog({ level: event.level ?? "info", message: event.message, timestamp: ts });
-        } else if (event.type === "task_log") {
-          onTaskLog(event.task_id, { level: event.level ?? "info", message: event.message, timestamp: ts });
-        } else if (event.type === "task_states") {
-          onTaskStates(event.tasks, event.elapsed_s);
-        } else if (event.type === "mapping_issues") {
-          onMappingIssues(event.issues);
-        } else if (event.type === "done") {
-          await onDone();
-        } else if (event.type === "error") {
-          onError(event.message);
-        }
-      } catch { /* ignore */ }
-    }
-  }
-}
-
 export interface AirflowConfig {
   base_url: string;
   username: string;
