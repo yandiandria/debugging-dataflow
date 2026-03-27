@@ -853,58 +853,60 @@ async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse
                         params["map_index"] = str(map_index)
 
                     try:
-                        log_resp = await client.get(
-                            log_url,
-                            params=params,
-                            headers={"Authorization": auth_header}
-                        )
+                        log_text = ""
+                        log_status = "not_found"
+                        max_retries = 3
 
-                        # 404 can mean no logs yet, task never ran, or wrong map_index/try_number
-                        if log_resp.status_code == 404:
-                            yield _log(
-                                f"[{idx}/{len(all_task_instances)}] {task_id}"
-                                f"(map_index={map_index}, try={try_number}): No logs (404)",
-                                "warning"
+                        # Retry logic for 404s (logs not ready yet)
+                        for attempt in range(max_retries):
+                            log_resp = await client.get(
+                                log_url,
+                                params=params,
+                                headers={"Authorization": auth_header}
                             )
-                            all_logs.append({
-                                "task_id": task_id,
-                                "map_index": map_index,
-                                "try_number": try_number,
-                                "state": state,
-                                "logs": "",
-                                "status": "not_found"
-                            })
-                        elif log_resp.status_code == 200:
-                            # Logs endpoint returns plain text, not JSON
-                            log_text = log_resp.text
+
+                            if log_resp.status_code == 200:
+                                log_text = log_resp.text
+                                log_status = "success"
+                                break
+                            elif log_resp.status_code == 404:
+                                # Logs not ready, wait and retry
+                                if attempt < max_retries - 1:
+                                    yield _log(
+                                        f"[{idx}/{len(all_task_instances)}] {task_id}: Logs not ready, retrying... ({attempt + 1}/{max_retries})",
+                                        "info"
+                                    )
+                                    await asyncio.sleep(2)  # Wait 2 seconds before retry
+                                else:
+                                    log_status = "not_found"
+                                    yield _log(
+                                        f"[{idx}/{len(all_task_instances)}] {task_id}: No logs available after {max_retries} attempts",
+                                        "warning"
+                                    )
+                            else:
+                                log_status = f"error_{log_resp.status_code}"
+                                yield _log(
+                                    f"[{idx}/{len(all_task_instances)}] {task_id}: HTTP {log_resp.status_code}",
+                                    "warning"
+                                )
+                                break
+
+                        if log_text:
                             yield _log(
                                 f"[{idx}/{len(all_task_instances)}] {task_id}"
                                 f"(map_index={map_index}, try={try_number}, state={state}): "
                                 f"{len(log_text)} bytes",
                                 "success"
                             )
-                            all_logs.append({
-                                "task_id": task_id,
-                                "map_index": map_index,
-                                "try_number": try_number,
-                                "state": state,
-                                "logs": log_text,
-                                "status": "success"
-                            })
-                        else:
-                            yield _log(
-                                f"[{idx}/{len(all_task_instances)}] {task_id}"
-                                f"(map_index={map_index}, try={try_number}): HTTP {log_resp.status_code}",
-                                "warning"
-                            )
-                            all_logs.append({
-                                "task_id": task_id,
-                                "map_index": map_index,
-                                "try_number": try_number,
-                                "state": state,
-                                "logs": "",
-                                "status": f"error_{log_resp.status_code}"
-                            })
+
+                        all_logs.append({
+                            "task_id": task_id,
+                            "map_index": map_index,
+                            "try_number": try_number,
+                            "state": state,
+                            "logs": log_text,
+                            "status": log_status
+                        })
                     except Exception as e:
                         yield _log(
                             f"[{idx}/{len(all_task_instances)}] {task_id}: Exception: {e}",
