@@ -480,6 +480,48 @@ export async function listAirflowDags(forceRefresh = false): Promise<AirflowDags
   };
 }
 
+// ── Docker helpers ──────────────────────────────────────────────────────────
+
+export interface DockerContainer {
+  id: string;
+  name: string;
+  image: string;
+  status: string;
+  is_airflow: boolean;
+}
+
+export async function listDockerContainers(): Promise<DockerContainer[]> {
+  const res = await fetch(`${BASE_URL}/api/docker/containers`);
+  if (!res.ok) throw new Error("Failed to list Docker containers");
+  return res.json();
+}
+
+// ── Config export / import ──────────────────────────────────────────────────
+
+export async function exportConfig(): Promise<void> {
+  const res = await fetch(`${BASE_URL}/api/config/export`);
+  if (!res.ok) throw new Error("Export failed");
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `dataflow-config-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function importConfig(file: File): Promise<{ restored: string[] }> {
+  const text = await file.text();
+  const bundle = JSON.parse(text);
+  const res = await fetch(`${BASE_URL}/api/config/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(bundle),
+  });
+  if (!res.ok) throw new Error("Import failed");
+  return res.json();
+}
+
 export async function triggerDagStream(
   dag_id: string,
   padoa_env: string,
