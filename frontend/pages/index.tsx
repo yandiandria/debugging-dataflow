@@ -44,7 +44,7 @@ function detectBatchStart(matchingBlobs: BlobInfo[]): string {
 export default function Home() {
   const [step, setStep] = useState<Step>("connect");
   const [containerUrl, setContainerUrl] = useState(
-    () => localStorage.getItem("dataflow_container_url") ?? ""
+    () => (typeof window !== 'undefined' ? localStorage.getItem("dataflow_container_url") : null) ?? ""
   );
   const [blobs, setBlobs] = useState<BlobInfo[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -115,6 +115,17 @@ export default function Home() {
   useEffect(() => {
     getResources().then(setResources).catch(() => {});
   }, []);
+
+  // Persist containerUrl to localStorage
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (containerUrl) {
+        localStorage.setItem("dataflow_container_url", containerUrl);
+      } else {
+        localStorage.removeItem("dataflow_container_url");
+      }
+    }
+  }, [containerUrl]);
 
   // Auto-navigate to dashboard on first load when saved containerUrl + resources are available
   const hasAutoNavigated = useRef(false);
