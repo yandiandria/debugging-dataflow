@@ -604,6 +604,51 @@ export interface AirflowConfig {
   verify_tls?: boolean;
 }
 
+export interface TaskInstanceState {
+  task_id: string;
+  state: string;
+  start_date: string | null;
+  end_date: string | null;
+}
+
+/** Lightweight poll — returns task instance states without fetching logs. */
+export async function getTaskStates(
+  config: AirflowConfig,
+  dag_id: string,
+  run_id: string,
+): Promise<TaskInstanceState[]> {
+  const res = await fetch(`${BASE_URL}/api/dags/task-states`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...config, dag_id, run_id }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to fetch task states");
+  }
+  return res.json();
+}
+
+/** Fetch logs for a single running task (1 HTTP call instead of N). */
+export async function getRunningTaskLog(
+  config: AirflowConfig,
+  dag_id: string,
+  run_id: string,
+  task_id: string,
+  try_number = 1,
+): Promise<{ task_id: string; logs: string }> {
+  const res = await fetch(`${BASE_URL}/api/dags/running-task-log`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...config, dag_id, run_id, task_id, try_number }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to fetch running task log");
+  }
+  return res.json();
+}
+
 export interface TaskLog {
   task_id: string;
   map_index: number;
