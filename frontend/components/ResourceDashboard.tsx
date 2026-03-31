@@ -3,7 +3,7 @@ import LogPanel from "./LogPanel";
 import type { VolumetryEntry } from "./VolumetryPanel";
 import type {
   Resource, DAG, DAGConfig, DAGRun, IntegrationRule, MappingIssue, QAExampleID,
-  BlobInfo, LogEntry, AirflowConfig,
+  BlobInfo, LogEntry, AirflowConfig, TaskInstanceState,
 } from "../lib/api";
 import {
   getDags, getDagConfig, getDagRuns, getDagRun, updateDagRun,
@@ -15,7 +15,30 @@ import {
   linkResourceDags,
   profileBlobsStream,
   getResourceBlobs,
+  createDag,
+  getBlobPreview,
+  getLatestAirflowRunId,
+  getTaskStates,
+  getRunningTaskLog,
 } from "../lib/api";
+
+const STAGE_SHORT: Record<string, string> = {
+  extract: "Extraction",
+  transform: "Transformation",
+  clean_cleaned: "Nettoyage (Clean)",
+  clean_incoherent: "Nettoyage (Incohérent)",
+  compare_identify: "Comparaison & Identification",
+};
+
+const STAGE_ROWS: string[][] = [
+  ["extract"],
+  ["transform"],
+  ["clean_cleaned", "clean_incoherent"],
+  ["compare_identify"],
+];
+
+type SectionKey = "config" | "logs" | "running";
+type LoadStatus = "idle" | "loading" | "loaded" | "error";
 
 interface Props {
   resources: Resource[];
