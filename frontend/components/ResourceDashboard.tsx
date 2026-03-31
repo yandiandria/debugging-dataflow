@@ -753,7 +753,330 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       </div>
 
       <div className="max-w-7xl mx-auto px-6 py-6 space-y-6">
-        {/* Top row: Volumetry + Mapping Issues */}
+        {/* DAG Management Card */}
+        {linkedDags.length > 0 && (
+          <div className="bg-white border border-gray-200 rounded-xl p-4">
+            {/* Primary action row */}
+            <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-100">
+              <div className="flex items-center gap-3">
+                {linkedDags.length > 1 && (
+                  <select
+                    value={selectedLinkedDagId}
+                    onChange={(e) => setSelectedLinkedDagId(e.target.value)}
+                    className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                  >
+                    {linkedDags.map((dag) => (
+                      <option key={dag.id} value={dag.id}>{dag.display_name}</option>
+                    ))}
+                  </select>
+                )}
+                {linkedDags.length === 1 && (
+                  <span className="text-sm font-medium text-gray-800">{linkedDags[0].display_name}</span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {onTraceBatch && (
+                  <button
+                    onClick={handleTraceBatch}
+                    disabled={resourceBlobs.length === 0 || loadingBlobs}
+                    className="text-xs bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:bg-gray-100 disabled:text-gray-400 px-3 py-1.5 rounded transition-colors"
+                  >
+                    {loadingBlobs ? "Loading…" : "Trace latest batch →"}
+                  </button>
+                )}
+                <button
+                  onClick={handleLoadLastRun}
+                  disabled={loadingLogsForDagId !== null || runningDagId !== null}
+                  className="text-xs bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white px-3 py-1.5 rounded transition-colors"
+                >
+                  {loadingLogsForDagId ? "Loading..." : "Load last run"}
+                </button>
+                <button
+                  onClick={handleTriggerDag}
+                  disabled={runningDagId !== null || loadingLogsForDagId !== null}
+                  className="text-xs bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-3 py-1.5 rounded transition-colors"
+                >
+                  {runningDagId ? "Running..." : "Run"}
+                </button>
+              </div>
+            </div>
+
+            {/* Accordion section 1: Configuration */}
+            <div className="space-y-2">
+              <button
+                onClick={() => setOpenSections((prev) => {
+                  const next = new Set(prev);
+                  if (next.has("config")) next.delete("config"); else next.add("config");
+                  return next;
+                })}
+                className="w-full flex items-center justify-between px-3 py-2 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <span className="text-sm font-semibold text-gray-700">Configuration</span>
+                <span className="text-gray-500">{openSections.has("config") ? "▼" : "▶"}</span>
+              </button>
+              {openSections.has("config") && (
+                <div className="px-3 py-3 space-y-3 bg-blue-50 border border-blue-100 rounded-lg">
+                  {/* Airflow config form */}
+                  <div>
+                    <button
+                      onClick={() => setShowAirflowConfig(!showAirflowConfig)}
+                      className={`text-xs px-3 py-1.5 rounded ${
+                        airflowConfig.base_url && airflowConfig.username && airflowConfig.password
+                          ? "bg-green-100 text-green-700 hover:bg-green-200"
+                          : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                      }`}
+                    >
+                      {airflowConfig.base_url ? "✓ REST API" : "Configure Airflow"}
+                    </button>
+                  </div>
+
+                  {showAirflowConfig && (
+                    <div className="p-3 bg-white border border-blue-200 rounded-lg space-y-2">
+                      <input
+                        type="text"
+                        placeholder="Base URL"
+                        value={airflowConfig.base_url}
+                        onChange={(e) => {
+                          const updated = { ...airflowConfig, base_url: e.target.value };
+                          setAirflowConfig(updated);
+                          localStorage.setItem("airflow_config", JSON.stringify(updated));
+                        }}
+                        className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Username"
+                        value={airflowConfig.username}
+                        onChange={(e) => {
+                          const updated = { ...airflowConfig, username: e.target.value };
+                          setAirflowConfig(updated);
+                          localStorage.setItem("airflow_config", JSON.stringify(updated));
+                        }}
+                        className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                      />
+                      <input
+                        type="password"
+                        placeholder="Password"
+                        value={airflowConfig.password}
+                        onChange={(e) => {
+                          const updated = { ...airflowConfig, password: e.target.value };
+                          setAirflowConfig(updated);
+                          localStorage.setItem("airflow_config", JSON.stringify(updated));
+                        }}
+                        className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                      />
+                      <label className="flex items-center gap-2 text-xs">
+                        <input
+                          type="checkbox"
+                          checked={airflowConfig.verify_tls !== false}
+                          onChange={(e) => {
+                            const updated = { ...airflowConfig, verify_tls: e.target.checked };
+                            setAirflowConfig(updated);
+                            localStorage.setItem("airflow_config", JSON.stringify(updated));
+                          }}
+                          className="rounded border-gray-300"
+                        />
+                        <span className="text-gray-600">Verify TLS</span>
+                      </label>
+                    </div>
+                  )}
+
+                  {/* Link DAGs dropdown */}
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowDagLinkDropdown(!showDagLinkDropdown)}
+                      disabled={linkingDags}
+                      className="text-xs text-indigo-600 hover:text-indigo-800 disabled:text-gray-400"
+                    >
+                      {linkingDags ? "Saving..." : "Link/Unlink DAGs"}
+                    </button>
+                    {showDagLinkDropdown && (
+                      <div className="absolute left-0 top-6 z-10 bg-white border border-gray-200 rounded-lg shadow-lg p-2 min-w-[200px]">
+                        {dags.length === 0 && <p className="text-xs text-gray-400 p-2">No DAGs defined.</p>}
+                        {dags.map((d) => (
+                          <label key={d.id} className="flex items-center gap-2 px-2 py-1 hover:bg-gray-50 cursor-pointer rounded">
+                            <input
+                              type="checkbox"
+                              checked={resourceDagIds.includes(d.id)}
+                              onChange={() => handleToggleDagLink(d.id)}
+                              className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                            />
+                            <span className="text-xs text-gray-700">{d.display_name}</span>
+                            <span className="text-xs font-mono text-gray-400">{d.dag_id}</span>
+                          </label>
+                        ))}
+                        <button
+                          onClick={() => setShowDagLinkDropdown(false)}
+                          className="mt-1 w-full text-xs text-gray-500 hover:text-gray-700 text-center py-1 border-t border-gray-100"
+                        >
+                          Done
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Create DAG inline */}
+                  {!showCreateDagForm ? (
+                    <button
+                      onClick={() => setShowCreateDagForm(true)}
+                      className="text-xs text-indigo-600 hover:text-indigo-800"
+                    >
+                      + Create new DAG
+                    </button>
+                  ) : (
+                    <div className="p-3 bg-white border border-indigo-200 rounded-lg space-y-2">
+                      <input
+                        type="text"
+                        placeholder="DAG ID"
+                        value={newDagId}
+                        onChange={(e) => setNewDagId(e.target.value)}
+                        className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Display Name"
+                        value={newDagDisplayName}
+                        onChange={(e) => setNewDagDisplayName(e.target.value)}
+                        className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleCreateDag}
+                          disabled={!newDagId || !newDagDisplayName || creatingDag}
+                          className="text-xs bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-2 py-1 rounded"
+                        >
+                          {creatingDag ? "Creating..." : "Create"}
+                        </button>
+                        <button
+                          onClick={() => {
+                            setShowCreateDagForm(false);
+                            setNewDagId("");
+                            setNewDagDisplayName("");
+                          }}
+                          className="text-xs bg-gray-200 hover:bg-gray-300 text-gray-800 px-2 py-1 rounded"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Accordion section 2: Logs des tasks terminées */}
+            <div className="space-y-2">
+              <button
+                onClick={() => setOpenSections((prev) => {
+                  const next = new Set(prev);
+                  if (next.has("logs")) next.delete("logs"); else next.add("logs");
+                  return next;
+                })}
+                className="w-full flex items-center justify-between px-3 py-2 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <span className="text-sm font-semibold text-gray-700">Logs des tasks terminées</span>
+                <span className="text-gray-500">{openSections.has("logs") ? "▼" : "▶"}</span>
+              </button>
+              {openSections.has("logs") && (
+                <div className="px-3 py-3 space-y-2 bg-gray-900 rounded-lg">
+                  {dagLogs.length > 0 && (
+                    <LogPanel entries={dagLogs} running={runningDagId !== null} />
+                  )}
+                  {completedTaskStates && Object.keys(completedTaskStates).length > 0 && (
+                    <div className="space-y-1 mt-3">
+                      {Object.entries(completedTaskStates).map(([taskId, state]) => {
+                        const isCollapsed = collapsedTasks.has(taskId);
+                        const stateColor =
+                          state === "success" ? "bg-green-900 text-green-300" :
+                          state === "failed" ? "bg-red-900 text-red-300" :
+                          state === "running" ? "bg-blue-900 text-blue-300" :
+                          state === "upstream_failed" ? "bg-amber-900 text-amber-300" :
+                          "bg-gray-800 text-gray-400";
+                        return (
+                          <div key={taskId} className="border border-gray-800 rounded-lg overflow-hidden">
+                            <button
+                              className="w-full flex items-center gap-2 px-3 py-2 bg-gray-900 hover:bg-gray-800 text-left transition-colors"
+                              onClick={() => setCollapsedTasks((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
+                                return next;
+                              })}
+                            >
+                              <span className="text-gray-500 text-xs w-3">{isCollapsed ? "▶" : "▼"}</span>
+                              <span className="text-xs font-mono text-gray-200 flex-1">{taskId}</span>
+                              <span className={`text-xs px-2 py-0.5 rounded font-medium ${stateColor}`}>{state}</span>
+                            </button>
+                            {!isCollapsed && (
+                              <LogPanel entries={taskLogs[taskId] ?? []} running={state === "running"} />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {dagLogs.length === 0 && (
+                    <button
+                      onClick={handleLoadLastRun}
+                      className="text-xs text-gray-400 hover:text-gray-300"
+                    >
+                      Load last run logs →
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Accordion section 3: Task en cours */}
+            <div className="space-y-2">
+              <button
+                onClick={() => setOpenSections((prev) => {
+                  const next = new Set(prev);
+                  if (next.has("running")) next.delete("running"); else next.add("running");
+                  return next;
+                })}
+                className="w-full flex items-center justify-between px-3 py-2 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <span className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+                  Task en cours
+                  {runningTaskId && (
+                    <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                  )}
+                </span>
+                <span className="text-gray-500">{openSections.has("running") ? "▼" : "▶"}</span>
+              </button>
+              {openSections.has("running") && (
+                <div className="px-3 py-3 space-y-2 bg-gray-900 rounded-lg">
+                  {Object.entries(liveTaskStates).length > 0 ? (
+                    <div className="space-y-1 mb-3">
+                      {Object.entries(liveTaskStates).map(([taskId, state]) => (
+                        <div key={taskId} className="flex items-center gap-2">
+                          <span className="text-xs font-mono text-gray-400">{taskId}:</span>
+                          <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                            state === "running" ? "bg-blue-900 text-blue-300" :
+                            state === "success" ? "bg-green-900 text-green-300" :
+                            state === "failed" ? "bg-red-900 text-red-300" :
+                            "bg-gray-800 text-gray-400"
+                          }`}>
+                            {state}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-400">No running tasks</p>
+                  )}
+                  {runningTaskLogText && (
+                    <div className="bg-black rounded p-2 text-xs text-gray-400 font-mono whitespace-pre-wrap overflow-auto max-h-64">
+                      {runningTaskLogText}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Results Section: Volumetry + Mapping Issues */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Volumetry */}
           <div className="bg-white border border-gray-200 rounded-xl p-4">
@@ -866,7 +1189,107 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
           </div>
         </div>
 
-        {/* Middle row: QA Example IDs + Integration Rules */}
+        {/* Results Section: Analyse des raisons */}
+        <div className="bg-white border border-gray-200 rounded-xl p-4">
+          <h3 className="text-sm font-semibold text-gray-700 mb-4">Analyse des raisons</h3>
+
+          <div className="space-y-4">
+            {/* Not linked mandatory */}
+            <div>
+              <h4 className="text-xs font-semibold text-gray-600 mb-2">Colonnes obligatoires non liées</h4>
+              {notLinkedStatus === "loading" ? (
+                <p className="text-xs text-gray-400">Loading...</p>
+              ) : Object.keys(notLinkedMandatory).length > 0 ? (
+                Object.entries(notLinkedMandatory).map(([column, rows]) => (
+                  <div key={column} className="mb-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-gray-700 font-mono">{column}</span>
+                      <button
+                        onClick={() => onAnalyzeExample && onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), column, (rows[0] as any)?.value || "")}
+                        className="text-xs text-indigo-600 hover:text-indigo-800"
+                      >
+                        Analyser →
+                      </button>
+                    </div>
+                    <div className="text-xs text-gray-600 bg-gray-50 rounded p-2 max-h-20 overflow-y-auto">
+                      {rows.slice(0, 5).map((row: any, idx) => (
+                        <div key={idx} className="truncate">{JSON.stringify(row)}</div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-gray-400">No data</p>
+              )}
+            </div>
+
+            {/* Not linked optional */}
+            <div>
+              <h4 className="text-xs font-semibold text-gray-600 mb-2">Colonnes optionnelles non liées</h4>
+              {Object.keys(notLinkedOptional).length > 0 ? (
+                Object.entries(notLinkedOptional).map(([column, rows]) => (
+                  <div key={column} className="mb-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-gray-700 font-mono">{column}</span>
+                      <button
+                        onClick={() => onAnalyzeExample && onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), column, (rows[0] as any)?.value || "")}
+                        className="text-xs text-indigo-600 hover:text-indigo-800"
+                      >
+                        Analyser →
+                      </button>
+                    </div>
+                    <div className="text-xs text-gray-600 bg-gray-50 rounded p-2 max-h-20 overflow-y-auto">
+                      {rows.slice(0, 5).map((row: any, idx) => (
+                        <div key={idx} className="truncate">{JSON.stringify(row)}</div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-gray-400">No data</p>
+              )}
+            </div>
+
+            {/* Incohérences */}
+            <div>
+              <h4 className="text-xs font-semibold text-gray-600 mb-2">Incohérences</h4>
+              {incoherenceStatus === "loading" ? (
+                <p className="text-xs text-gray-400">Loading...</p>
+              ) : Object.keys(incoherenceData).length > 0 ? (
+                Object.entries(incoherenceData).map(([errorCol, rows]) => (
+                  <div key={errorCol} className="mb-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs text-gray-700 font-mono">{errorCol}</span>
+                      <button
+                        onClick={() => onAnalyzeExample && onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), errorCol, "")}
+                        className="text-xs text-indigo-600 hover:text-indigo-800"
+                      >
+                        Analyser →
+                      </button>
+                    </div>
+                    <div className="text-xs text-gray-600 bg-gray-50 rounded p-2 max-h-32 overflow-y-auto">
+                      <table className="w-full text-left">
+                        <tbody>
+                          {rows.slice(0, 5).map((row: any, idx) => (
+                            <tr key={idx} className="border-b border-gray-200">
+                              {Object.entries(row).map(([key, val], colIdx) => (
+                                <td key={colIdx} className="px-2 py-1 truncate text-xs">{String(val)}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-xs text-gray-400">No data</p>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom row: QA Example IDs + Integration Rules */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* QA Example IDs */}
           <div className="bg-white border border-gray-200 rounded-xl p-4">
@@ -1004,229 +1427,6 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
               <p className="text-sm text-gray-400">No rules linked to this resource. Link rules in the Integration Rule Manager.</p>
             )}
           </div>
-        </div>
-
-        {/* Bottom: DAG Runner */}
-        <div className="bg-white border border-gray-200 rounded-xl p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-semibold text-gray-700">
-              DAG Runner
-              <span className="ml-2 text-xs text-gray-400 font-normal">padoa_env: {selectedEnv}</span>
-              {runningDagId !== null && (
-                <span className="ml-3 text-xs font-mono text-blue-500 animate-pulse">
-                  {Math.floor(runElapsedS / 60) > 0
-                    ? `${Math.floor(runElapsedS / 60)}m ${runElapsedS % 60}s`
-                    : `${runElapsedS}s`}
-                </span>
-              )}
-            </h3>
-            <div className="flex items-center gap-2">
-              {onTraceBatch && (
-                <button
-                  onClick={handleTraceBatch}
-                  disabled={resourceBlobs.length === 0 || loadingBlobs}
-                  className="text-xs bg-indigo-100 text-indigo-700 hover:bg-indigo-200 disabled:bg-gray-100 disabled:text-gray-400 px-2 py-1 rounded transition-colors"
-                  title={loadingBlobs ? "Loading blobs…" : resourceBlobs.length === 0 ? "No blobs found for this resource" : `Trace ${resourceBlobs.length} blob(s) from latest batch`}
-                >
-                  {loadingBlobs ? "Loading…" : "Trace latest batch →"}
-                </button>
-              )}
-              <button
-                onClick={() => setShowAirflowConfig(!showAirflowConfig)}
-                className={`text-xs px-2 py-1 rounded ${
-                  airflowConfig.base_url && airflowConfig.username && airflowConfig.password
-                    ? "bg-green-100 text-green-700 hover:bg-green-200"
-                    : "bg-gray-100 text-gray-600 hover:bg-gray-200"
-                }`}
-              >
-                {airflowConfig.base_url ? "✓ REST API" : "Configure"}
-              </button>
-              <div className="relative">
-                <button
-                  onClick={() => setShowDagLinkDropdown(!showDagLinkDropdown)}
-                  disabled={linkingDags}
-                  className="text-xs text-indigo-600 hover:text-indigo-800"
-                >
-                  {linkingDags ? "Saving..." : "Link DAGs"}
-                </button>
-              {showDagLinkDropdown && (
-                <div className="absolute right-0 top-6 z-10 bg-white border border-gray-200 rounded-lg shadow-lg p-2 min-w-[200px]">
-                  {dags.length === 0 && <p className="text-xs text-gray-400 p-2">No DAGs defined. Add them in DAG Manager.</p>}
-                  {dags.map((d) => (
-                    <label key={d.id} className="flex items-center gap-2 px-2 py-1 hover:bg-gray-50 cursor-pointer rounded">
-                      <input
-                        type="checkbox"
-                        checked={resourceDagIds.includes(d.id)}
-                        onChange={() => handleToggleDagLink(d.id)}
-                        className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                      />
-                      <span className="text-xs text-gray-700">{d.display_name}</span>
-                      <span className="text-xs text-gray-400 font-mono">{d.dag_id}</span>
-                    </label>
-                  ))}
-                  <button
-                    onClick={() => setShowDagLinkDropdown(false)}
-                    className="mt-1 w-full text-xs text-gray-500 hover:text-gray-700 text-center py-1 border-t border-gray-100"
-                  >
-                    Done
-                  </button>
-                </div>
-              )}
-              </div>
-            </div>
-          </div>
-
-          {/* Airflow REST API Config */}
-          {showAirflowConfig && (
-            <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-              <p className="text-xs text-blue-700 mb-2">Airflow REST API Configuration</p>
-              <div className="space-y-2">
-                <input
-                  type="text"
-                  placeholder="Base URL (e.g., http://localhost:8888)"
-                  value={airflowConfig.base_url}
-                  onChange={(e) => {
-                    const updated = { ...airflowConfig, base_url: e.target.value };
-                    setAirflowConfig(updated);
-                    localStorage.setItem("airflow_config", JSON.stringify(updated));
-                  }}
-                  className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
-                />
-                <input
-                  type="text"
-                  placeholder="Username"
-                  value={airflowConfig.username}
-                  onChange={(e) => {
-                    const updated = { ...airflowConfig, username: e.target.value };
-                    setAirflowConfig(updated);
-                    localStorage.setItem("airflow_config", JSON.stringify(updated));
-                  }}
-                  className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
-                />
-                <input
-                  type="password"
-                  placeholder="Password"
-                  value={airflowConfig.password}
-                  onChange={(e) => {
-                    const updated = { ...airflowConfig, password: e.target.value };
-                    setAirflowConfig(updated);
-                    localStorage.setItem("airflow_config", JSON.stringify(updated));
-                  }}
-                  className="w-full px-2 py-1 text-xs border border-gray-300 rounded"
-                />
-                <label className="flex items-center gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    checked={airflowConfig.verify_tls !== false}
-                    onChange={(e) => {
-                      const updated = { ...airflowConfig, verify_tls: e.target.checked };
-                      setAirflowConfig(updated);
-                      localStorage.setItem("airflow_config", JSON.stringify(updated));
-                    }}
-                    className="rounded border-gray-300"
-                  />
-                  <span className="text-gray-600">Verify TLS</span>
-                </label>
-                <button
-                  onClick={() => setShowAirflowConfig(false)}
-                  className="w-full text-xs bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded"
-                >
-                  Done
-                </button>
-              </div>
-            </div>
-          )}
-
-          {linkedDags.length > 0 ? (
-            <div className="space-y-2">
-              {linkedDags.map((dag, idx) => {
-                const lastRun = getLastRun(dag.dag_id);
-                const isRunning = runningDagId === dag.dag_id;
-                const isLoadingLogs = loadingLogsForDagId === dag.dag_id;
-                const isBusy = isRunning || isLoadingLogs || runningDagId !== null || loadingLogsForDagId !== null;
-
-                return (
-                  <div key={dag.id} className="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg">
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs text-gray-400 font-medium">{idx + 1}.</span>
-                      <span className="text-sm font-medium text-gray-800">{dag.display_name}</span>
-                      <span className="text-xs font-mono text-gray-400">{dag.dag_id}</span>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      {lastRun && (
-                        <span className={`text-xs ${lastRun.status === "triggered" ? "text-green-600" : "text-gray-500"}`}>
-                          {lastRun.status === "triggered" ? "\u2713" : "\u2717"}{" "}
-                          {new Date(lastRun.triggered_at).toLocaleString()}
-                        </span>
-                      )}
-                      {!lastRun && <span className="text-xs text-gray-400">not run yet</span>}
-                      {!airflowConfig.base_url && (
-                        <span className="text-xs text-amber-600" title="Configure Airflow REST API first">⚠ REST API</span>
-                      )}
-                      <button
-                        onClick={() => handleLoadLastRun(dag)}
-                        disabled={isBusy}
-                        className="text-xs bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
-                        title={!airflowConfig.base_url ? "Configure Airflow REST API first (click Configure button above)" : "Fetch latest run logs via REST API"}
-                      >
-                        {isLoadingLogs ? "Loading..." : "Load last run"}
-                      </button>
-                      <button
-                        onClick={() => handleTriggerDag(dag)}
-                        disabled={isBusy}
-                        className="text-xs bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white px-3 py-1 rounded-lg transition-colors"
-                      >
-                        {isRunning ? "Running..." : "Run"}
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-400">No DAGs linked. Click &quot;Link DAGs&quot; to add them.</p>
-          )}
-
-          {/* DAG logs — main terminal */}
-          {dagLogs.length > 0 && (
-            <div className="mt-4">
-              <LogPanel entries={dagLogs} running={runningDagId !== null} />
-            </div>
-          )}
-
-          {/* Per-task collapsible sub-terminals */}
-          {Object.keys(completedTaskStates).length > 0 && (
-            <div className="mt-3 space-y-1">
-              {Object.entries(completedTaskStates).map(([taskId, state]) => {
-                const isCollapsed = collapsedTasks.has(taskId);
-                const stateColor =
-                  state === "success" ? "bg-green-900 text-green-300" :
-                  state === "failed" ? "bg-red-900 text-red-300" :
-                  state === "running" ? "bg-blue-900 text-blue-300" :
-                  state === "upstream_failed" ? "bg-amber-900 text-amber-300" :
-                  "bg-gray-800 text-gray-400";
-                return (
-                  <div key={taskId} className="border border-gray-800 rounded-lg overflow-hidden">
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 bg-gray-900 hover:bg-gray-800 text-left transition-colors"
-                      onClick={() => setCollapsedTasks((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(taskId)) next.delete(taskId); else next.add(taskId);
-                        return next;
-                      })}
-                    >
-                      <span className="text-gray-500 text-xs w-3">{isCollapsed ? "▶" : "▼"}</span>
-                      <span className="text-xs font-mono text-gray-200 flex-1">{taskId}</span>
-                      <span className={`text-xs px-2 py-0.5 rounded font-medium ${stateColor}`}>{state}</span>
-                    </button>
-                    {!isCollapsed && (
-                      <LogPanel entries={taskLogs[taskId] ?? []} running={state === "running"} />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
         </div>
       </div>
     </div>
