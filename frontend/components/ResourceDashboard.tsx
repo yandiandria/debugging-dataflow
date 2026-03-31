@@ -84,13 +84,38 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
   // DAG runner
   const [dagLogs, setDagLogs] = useState<LogEntry[]>([]);
   const [taskLogs, setTaskLogs] = useState<Record<string, LogEntry[]>>({});
-  const [taskStates, setTaskStates] = useState<Record<string, string>>({});
+  const [completedTaskStates, setCompletedTaskStates] = useState<Record<string, string>>({});
   const [collapsedTasks, setCollapsedTasks] = useState<Set<string>>(new Set());
   const [runningDagId, setRunningDagId] = useState<string | null>(null);
   const [loadingLogsForDagId, setLoadingLogsForDagId] = useState<string | null>(null);
   const [runElapsedS, setRunElapsedS] = useState<number>(0);
   const restoredLogsForRef = useRef<string | null>(null);
   const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // New DAG selection + live watcher state
+  const [selectedLinkedDagId, setSelectedLinkedDagId] = useState<string>("");
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [currentDagId, setCurrentDagId] = useState<string | null>(null);
+  const [liveTaskStates, setLiveTaskStates] = useState<Record<string, string>>({});
+  const [runningTaskId, setRunningTaskId] = useState<string | null>(null);
+  const [runningTaskLogText, setRunningTaskLogText] = useState<string>("");
+  const watcherRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Section toggles
+  const [openSections, setOpenSections] = useState<Set<SectionKey>>(new Set());
+
+  // Inline DAG creation
+  const [showCreateDagForm, setShowCreateDagForm] = useState(false);
+  const [newDagId, setNewDagId] = useState("");
+  const [newDagDisplayName, setNewDagDisplayName] = useState("");
+  const [creatingDag, setCreatingDag] = useState(false);
+
+  // Analysis data
+  const [notLinkedMandatory, setNotLinkedMandatory] = useState<Record<string, any[]>>({});
+  const [notLinkedOptional, setNotLinkedOptional] = useState<Record<string, any[]>>({});
+  const [notLinkedStatus, setNotLinkedStatus] = useState<LoadStatus>("idle");
+  const [incoherenceData, setIncoherenceData] = useState<Record<string, any[]>>({});
+  const [incoherenceStatus, setIncoherenceStatus] = useState<LoadStatus>("idle");
 
   // Tick elapsed time while a DAG is running
   useEffect(() => {
@@ -144,7 +169,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       if (full.task_final_states) {
         const m: Record<string, string> = {};
         full.task_final_states.forEach(({ task_id, state }) => { m[task_id] = state; });
-        setTaskStates(m);
+        setCompletedTaskStates(m);
         setCollapsedTasks(new Set(full.task_final_states.map((t) => t.task_id)));
       }
     }).catch(() => {});
@@ -240,6 +265,57 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       .catch(() => setColumnValues([]));
   }, [selectedIdColumn, resourceBlobs, containerUrl]);
 
+  // Auto-select first linked DAG
+  useEffect(() => {
+    if (linkedDags.length > 0 && !selectedLinkedDagId) {
+      setSelectedLinkedDagId(linkedDags[0].id);
+    }
+  }, [linkedDags, selectedLinkedDagId]);
+
+  // Watcher effect: poll task states every 2s when a run is active
+  useEffect(() => {
+    if (!currentRunId || !currentDagId) return;
+
+    watcherRef.current = setInterval(async () => {
+      try {
+        const states = await getTaskStates(currentDagId, currentRunId);
+        setLiveTaskStates(states.task_states || {});
+
+        // Find a running task
+        const running = Object.entries(states.task_states || {}).find(([, state]) => state === "running");
+        if (running) {
+          setRunningTaskId(running[0]);
+          const logs = await getRunningTaskLog(currentDagId, currentRunId, running[0]);
+          setRunningTaskLogText(logs || "");
+          // Auto-open "running" section
+          setOpenSections((prev) => new Set([...Array.from(prev), "running"]));
+        } else {
+          setRunningTaskId(null);
+          setRunningTaskLogText("");
+        }
+      } catch {
+        // Silently fail — watcher continues polling
+      }
+    }, 2000);
+
+    return () => {
+      if (watcherRef.current) clearInterval(watcherRef.current);
+    };
+  }, [currentRunId, currentDagId]);
+
+  // Analysis effect: load not-linked and incoherence analysis when resource blobs load
+  useEffect(() => {
+    if (resourceBlobs.length === 0) return;
+
+    (async () => {
+      // Run both analyses in parallel
+      await Promise.allSettled([
+        loadNotLinkedAnalysis(),
+        loadIncoherenceAnalysis(),
+      ]);
+    })();
+  }, [resourceBlobs, selectedResourceId]);
+
   // Volumetry
   const handleRefreshVolumetry = async () => {
     if (!selectedResourceId || resourceBlobs.length === 0) return;
@@ -291,17 +367,68 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     onTraceBatch(sorted.slice(batchStartIndex).map((b) => b.name));
   };
 
+  // Analysis: not-linked mandatory/optional columns
+  const loadNotLinkedAnalysis = useCallback(async () => {
+    if (resourceBlobs.length === 0) return;
+    setNotLinkedStatus("loading");
+    try {
+      const blobNames = resourceBlobs.map((b) => b.name);
+      // Call getBlobPreview for "extract" stage to get not-linked columns
+      const data = await getBlobPreview(containerUrl, blobNames, "extract");
+      // Group by column (you may need to adjust based on actual API response)
+      const grouped: Record<string, any[]> = {};
+      if (data && Array.isArray(data)) {
+        data.forEach((row: any) => {
+          const col = row.column || "unknown";
+          if (!grouped[col]) grouped[col] = [];
+          grouped[col].push(row);
+        });
+      }
+      setNotLinkedMandatory(grouped);
+      setNotLinkedStatus("loaded");
+    } catch (e) {
+      setNotLinkedStatus("error");
+    }
+  }, [resourceBlobs, containerUrl]);
+
+  // Analysis: incoherence data
+  const loadIncoherenceAnalysis = useCallback(async () => {
+    if (resourceBlobs.length === 0) return;
+    setIncoherenceStatus("loading");
+    try {
+      const blobNames = resourceBlobs.map((b) => b.name);
+      // Call getBlobPreview for "clean_incoherent" stage
+      const data = await getBlobPreview(containerUrl, blobNames, "clean_incoherent");
+      // Group by error_column
+      const grouped: Record<string, any[]> = {};
+      if (data && Array.isArray(data)) {
+        data.forEach((row: any) => {
+          const col = row.error_column || "unknown";
+          if (!grouped[col]) grouped[col] = [];
+          grouped[col].push(row);
+        });
+      }
+      setIncoherenceData(grouped);
+      setIncoherenceStatus("loaded");
+    } catch (e) {
+      setIncoherenceStatus("error");
+    }
+  }, [resourceBlobs, containerUrl]);
+
   // DAG runner
   const linkedDags = useMemo(() => {
     return resourceDagIds.map((id) => dags.find((d) => d.id === id)).filter(Boolean) as DAG[];
   }, [resourceDagIds, dags]);
 
-  const handleTriggerDag = async (dag: DAG) => {
-    setRunningDagId(dag.dag_id);
+  const handleTriggerDag = async () => {
+    const selectedDag = linkedDags.find((d) => d.id === selectedLinkedDagId);
+    if (!selectedDag) return;
+
+    setRunningDagId(selectedDag.dag_id);
     setRunElapsedS(0);
     setDagLogs([]);
     setTaskLogs({});
-    setTaskStates({});
+    setCompletedTaskStates({});
     setCollapsedTasks(new Set());
     restoredLogsForRef.current = selectedResourceId; // don't overwrite with history while running
 
@@ -320,20 +447,25 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     };
     const updateStates = (tasks: Array<{ task_id: string; state: string }>, elapsedS?: number) => {
       tasks.forEach((t) => { collectedTaskStates[t.task_id] = t.state; });
-      setTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
+      setCompletedTaskStates(Object.fromEntries(tasks.map((t) => [t.task_id, t.state])));
       if (elapsedS !== undefined) setRunElapsedS(elapsedS);
     };
 
     await triggerDagStream(
-      dag.dag_id,
+      selectedDag.dag_id,
       selectedEnv,
       addLog,
       async (result) => {
         setRunningDagId(null);
+        // Set live watcher state
+        if (result.run_id) {
+          setCurrentRunId(result.run_id);
+          setCurrentDagId(selectedDag.dag_id);
+        }
         if (result.run_id && airflowConfig.base_url && airflowConfig.username && airflowConfig.password) {
           await fetchDagLogsRestApi(
             airflowConfig,
-            dag.dag_id,
+            selectedDag.dag_id,
             addLog,
             (taskId: string, logs: string) => {
               const taskEntries = logs.split("\n")
@@ -353,7 +485,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
                 states[log.task_id] = log.state;
                 collectedTaskStates[log.task_id] = log.state;
               }
-              setTaskStates(states);
+              setCompletedTaskStates(states);
               await updateDagRun(result.record_id, {
                 task_logs: collectedLogs,
                 task_sub_logs: Object.entries(collectedTaskLogs).map(([task_id, logs]) => ({ task_id, logs })),
@@ -374,12 +506,15 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     );
   };
 
-  const handleLoadLastRun = async (dag: DAG) => {
-    setLoadingLogsForDagId(dag.dag_id);
+  const handleLoadLastRun = async () => {
+    const selectedDag = linkedDags.find((d) => d.id === selectedLinkedDagId);
+    if (!selectedDag) return;
+
+    setLoadingLogsForDagId(selectedDag.dag_id);
     setRunElapsedS(0);
     setDagLogs([]);
     setTaskLogs({});
-    setTaskStates({});
+    setCompletedTaskStates({});
     setCollapsedTasks(new Set());
     restoredLogsForRef.current = selectedResourceId;
 
@@ -389,11 +524,18 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
         throw new Error("Please configure Airflow REST API connection first (click Configure button)");
       }
 
+      // Get the latest run ID for this DAG
+      const runId = await getLatestAirflowRunId(selectedDag.dag_id, selectedEnv);
+      if (runId) {
+        setCurrentRunId(runId);
+        setCurrentDagId(selectedDag.dag_id);
+      }
+
       const addLog = (entry: LogEntry) => setDagLogs((prev) => [...prev, entry]);
 
       await fetchDagLogsRestApi(
         airflowConfig,
-        dag.dag_id,
+        selectedDag.dag_id,
         addLog,
         (taskId: string, logs: string) => {
           setTaskLogs((prev) => {
@@ -415,7 +557,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
             states[log.task_id] = log.state;
             allLogText += log.logs + "\n";
           }
-          setTaskStates(states);
+          setCompletedTaskStates(states);
 
           // Parse mapping issues from loaded logs
           const mappingIssuePattern = /\} WARNING - Les valeurs (\(.+?\)) \((\d+)\) ne sont pas présentes dans le mapping (.+?)\./g;
@@ -431,7 +573,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
 
           // Save mapping issues if any found
           if (foundIssues.length > 0 && selectedResourceId) {
-            const localRecord = dagRuns.find((r) => r.dag_id === dag.dag_id);
+            const localRecord = dagRuns.find((r) => r.dag_id === selectedDag.dag_id);
             if (localRecord) {
               await saveMappingIssues(foundIssues, selectedResourceId, localRecord.id);
               const updated = await getMappingIssues(selectedResourceId);
@@ -461,6 +603,28 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     return dagRuns
       .filter((r) => r.dag_id === dagId && r.padoa_env === selectedEnv)
       .sort((a, b) => b.triggered_at.localeCompare(a.triggered_at))[0];
+  };
+
+  // Create new DAG inline
+  const handleCreateDag = async () => {
+    if (!newDagId || !newDagDisplayName || !selectedResourceId) return;
+    setCreatingDag(true);
+    try {
+      await createDag(newDagId, newDagDisplayName);
+      await linkResourceDags(selectedResourceId, [...resourceDagIds, newDagId]);
+      setResourceDagIds([...resourceDagIds, newDagId]);
+      // Refresh DAG list
+      const updatedDags = await getDags();
+      setDags(updatedDags);
+      // Reset form
+      setNewDagId("");
+      setNewDagDisplayName("");
+      setShowCreateDagForm(false);
+    } catch (e) {
+      // Handle error silently or add to logs
+    } finally {
+      setCreatingDag(false);
+    }
   };
 
   // DAG linking
@@ -1031,9 +1195,9 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
           )}
 
           {/* Per-task collapsible sub-terminals */}
-          {Object.keys(taskStates).length > 0 && (
+          {Object.keys(completedTaskStates).length > 0 && (
             <div className="mt-3 space-y-1">
-              {Object.entries(taskStates).map(([taskId, state]) => {
+              {Object.entries(completedTaskStates).map(([taskId, state]) => {
                 const isCollapsed = collapsedTasks.has(taskId);
                 const stateColor =
                   state === "success" ? "bg-green-900 text-green-300" :
