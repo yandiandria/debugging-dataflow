@@ -20,8 +20,31 @@ import {
   updateResource,
   deleteResource,
   profileBlobsStream,
+  createDag,
+  getBlobPreview,
+  getLatestAirflowRunId,
+  getTaskStates,
+  getRunningTaskLog,
 } from "../lib/api";
-import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource } from "../lib/api";
+import type { BlobInfo, FilterCondition, AnalyzeResultFull, LogEntry, Resource, TaskInstanceState } from "../lib/api";
+
+const STAGE_SHORT: Record<string, string> = {
+  extract: "Extraction",
+  transform: "Transformation",
+  clean_cleaned: "Nettoyage (Clean)",
+  clean_incoherent: "Nettoyage (Incohérent)",
+  compare_identify: "Comparaison & Identification",
+};
+
+const STAGE_ROWS: string[][] = [
+  ["extract"],
+  ["transform"],
+  ["clean_cleaned", "clean_incoherent"],
+  ["compare_identify"],
+];
+
+type SectionKey = "config" | "logs" | "running";
+type LoadStatus = "idle" | "loading" | "loaded" | "error";
 
 type Step = "connect" | "browse" | "config" | "analyzing" | "results" | "resources" | "dags" | "rules" | "dashboard" | "history" | "notion";
 
