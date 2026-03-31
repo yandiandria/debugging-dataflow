@@ -932,6 +932,86 @@ async def get_dag_logs_rest_api(body: AirflowRestAPIConfig) -> StreamingResponse
     )
 
 
+class TaskStatesRequest(BaseModel):
+    base_url: str
+    username: str
+    password: str
+    dag_id: str
+    run_id: str
+    verify_tls: bool = True
+
+
+@app.post("/api/dags/task-states")
+async def get_dag_task_states(body: TaskStatesRequest):
+    """Return task instance states for a given DAG run (no log fetching).
+    Designed for 2-second polling to detect the currently running task.
+    """
+    credentials = f"{body.username}:{body.password}"
+    auth_header = f"Basic {base64.b64encode(credentials.encode()).decode()}"
+    base_url = body.base_url.rstrip("/")
+    dag_id_encoded = quote(body.dag_id, safe="")
+    run_id_encoded = quote(body.run_id, safe="")
+
+    async with httpx.AsyncClient(verify=body.verify_tls, timeout=15.0) as client:
+        try:
+            resp = await client.get(
+                f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns/{run_id_encoded}/taskInstances",
+                params={"limit": "200"},
+                headers={"Authorization": auth_header},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    instances = resp.json().get("task_instances", [])
+    return [
+        {
+            "task_id": ti.get("task_id", ""),
+            "state": ti.get("state") or "none",
+            "start_date": ti.get("start_date"),
+            "end_date": ti.get("end_date"),
+        }
+        for ti in instances
+    ]
+
+
+class RunningTaskLogRequest(BaseModel):
+    base_url: str
+    username: str
+    password: str
+    dag_id: str
+    run_id: str
+    task_id: str
+    try_number: int = 1
+    verify_tls: bool = True
+
+
+@app.post("/api/dags/running-task-log")
+async def get_running_task_log(body: RunningTaskLogRequest):
+    """Fetch logs for a single task instance (the currently running one).
+    Much lighter than fetching all task logs.
+    """
+    credentials = f"{body.username}:{body.password}"
+    auth_header = f"Basic {base64.b64encode(credentials.encode()).decode()}"
+    base_url = body.base_url.rstrip("/")
+    dag_id_encoded = quote(body.dag_id, safe="")
+    run_id_encoded = quote(body.run_id, safe="")
+    task_id_encoded = quote(body.task_id, safe="")
+    log_url = (
+        f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns/{run_id_encoded}"
+        f"/taskInstances/{task_id_encoded}/logs/{body.try_number}"
+    )
+
+    async with httpx.AsyncClient(verify=body.verify_tls, timeout=15.0) as client:
+        result = await _fetch_single_task_log(
+            client, auth_header, log_url, {}, body.task_id, -1, body.try_number, "running", max_retries=1
+        )
+
+    return {"task_id": body.task_id, "logs": result.get("logs", "")}
+
+
 @app.post("/api/dags/list-airflow")
 async def list_airflow_dags(force_refresh: bool = False):
     """List DAGs from airflow CLI with in-memory TTL cache (5 min).
