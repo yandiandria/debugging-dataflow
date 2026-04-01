@@ -16,6 +16,7 @@ import {
   profileBlobsStream,
   getResourceBlobs,
   createDag,
+  getBlobPreview,
   getLatestAirflowRunId,
   getTaskStates,
   getRunningTaskLog,
@@ -47,6 +48,13 @@ const STAGE_ROWS: string[][] = [
 
 type SectionKey = "config" | "logs" | "running";
 type LoadStatus = "idle" | "loading" | "loaded" | "error";
+
+interface StagePreview {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  total: number;
+  blobName: string;
+}
 
 interface Props {
   resources: Resource[];
@@ -118,12 +126,11 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
   const [newDagDisplayName, setNewDagDisplayName] = useState("");
   const [creatingDag, setCreatingDag] = useState(false);
 
-  // Analysis data
-  const [notLinkedMandatory, setNotLinkedMandatory] = useState<Record<string, any[]>>({});
-  const [notLinkedOptional, setNotLinkedOptional] = useState<Record<string, any[]>>({});
-  const [notLinkedStatus, setNotLinkedStatus] = useState<LoadStatus>("idle");
-  const [incoherenceData, setIncoherenceData] = useState<Record<string, any[]>>({});
-  const [incoherenceStatus, setIncoherenceStatus] = useState<LoadStatus>("idle");
+  // Analysis data: blob preview rows per stage
+  const [notLinkedMandatoryPreview, setNotLinkedMandatoryPreview] = useState<StagePreview | null>(null);
+  const [notLinkedOptionalPreview, setNotLinkedOptionalPreview] = useState<StagePreview | null>(null);
+  const [incoherencePreview, setIncoherencePreview] = useState<StagePreview | null>(null);
+  const [analysisStatus, setAnalysisStatus] = useState<LoadStatus>("idle");
 
   // Volumetry: expanded stage cards (for column profiling detail)
   const [expandedStages, setExpandedStages] = useState<Set<string>>(new Set());
@@ -311,11 +318,39 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     };
   }, [currentRunId, currentDagId, airflowConfig]);
 
-  // Analysis effect: parse not-linked and incoherence data from task logs
+  // Analysis effect: load blob previews for analysis stages when resource blobs are available
   useEffect(() => {
-    if (Object.keys(taskLogs).length === 0 && Object.keys(completedTaskStates).length === 0) return;
-    parseAnalysisFromLogs();
-  }, [taskLogs, completedTaskStates]);
+    if (resourceBlobs.length === 0 || !containerUrl) return;
+    loadAnalysisPreviews();
+  }, [resourceBlobs, containerUrl]);
+
+  const loadAnalysisPreviews = useCallback(async () => {
+    setAnalysisStatus("loading");
+    const findBlobForStage = (stage: string) =>
+      resourceBlobs.find((b) => b.detected_stage === stage) ??
+      resourceBlobs.find((b) => b.name.toLowerCase().includes(stage));
+
+    const loadPreview = async (stage: string): Promise<StagePreview | null> => {
+      const blob = findBlobForStage(stage);
+      if (!blob) return null;
+      const data = await getBlobPreview(containerUrl, blob.name, 200);
+      return { columns: data.columns, rows: data.rows, total: data.total_rows_loaded, blobName: blob.name };
+    };
+
+    try {
+      const [mandatory, optional, incoherent] = await Promise.allSettled([
+        loadPreview("compare_and_identify_not_linked_mandatory"),
+        loadPreview("compare_and_identify_not_linked_optional"),
+        loadPreview("clean_incoherent"),
+      ]);
+      setNotLinkedMandatoryPreview(mandatory.status === "fulfilled" ? mandatory.value : null);
+      setNotLinkedOptionalPreview(optional.status === "fulfilled" ? optional.value : null);
+      setIncoherencePreview(incoherent.status === "fulfilled" ? incoherent.value : null);
+      setAnalysisStatus("loaded");
+    } catch {
+      setAnalysisStatus("error");
+    }
+  }, [resourceBlobs, containerUrl]);
 
   // Volumetry
   const handleRefreshVolumetry = async () => {
@@ -367,87 +402,6 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     }
     onTraceBatch(sorted.slice(batchStartIndex).map((b) => b.name));
   };
-
-  // Parse not-linked (mandatory/optional) and incoherence data from loader task logs.
-  // Loader tasks emit lines like:
-  //   WARNING - not_linked_mandatory: employee not found (column: employee_id) - 42 rows
-  //   WARNING - not_linked_optional: medical_member not found (column: medical_member_id) - 12 rows
-  //   WARNING - incoherence: <category> - <count> rows
-  // We also look for reporting-style lines from the loader tasks.
-  const parseAnalysisFromLogs = useCallback(() => {
-    const allLogText: string[] = [];
-    for (const [, entries] of Object.entries(taskLogs)) {
-      for (const entry of entries) {
-        allLogText.push(entry.message);
-      }
-    }
-    const fullText = allLogText.join("\n");
-
-    // --- Not linked mandatory ---
-    // Pattern: WARNING - not_linked_mandatory: <reason> (column: <col>) - <N> rows
-    // Also matches: WARNING - Les identifiants ... ne sont pas liés (mandatory) ... column: <col>
-    const mandatoryGroups: Record<string, any[]> = {};
-    const mandatoryPattern = /WARNING\s*-\s*(?:not_linked_mandatory|Les identifiants[^)]*mandatory)[^(]*\((?:column:\s*)?(\S+)\)[^\d]*(\d+)\s*(?:rows?|lignes?)/gi;
-    let m: RegExpExecArray | null;
-    while ((m = mandatoryPattern.exec(fullText)) !== null) {
-      const col = m[1];
-      const count = parseInt(m[2]);
-      if (!mandatoryGroups[col]) mandatoryGroups[col] = [];
-      mandatoryGroups[col].push({ column: col, count, raw: m[0] });
-    }
-    // Also try a more generic pattern for "employee not found", "medical member not found" etc.
-    const notFoundPattern = /WARNING\s*-\s*(\w[\w\s]*?)\s+not\s+found\s*\((?:column:\s*)?(\S+)\)[^\d]*(\d+)/gi;
-    while ((m = notFoundPattern.exec(fullText)) !== null) {
-      const reason = m[1].trim();
-      const col = m[2];
-      const count = parseInt(m[3]);
-      if (!mandatoryGroups[col]) mandatoryGroups[col] = [];
-      // Avoid duplicates
-      if (!mandatoryGroups[col].some((r: any) => r.reason === reason && r.count === count)) {
-        mandatoryGroups[col].push({ column: col, reason, count, raw: m[0] });
-      }
-    }
-
-    // --- Not linked optional ---
-    const optionalGroups: Record<string, any[]> = {};
-    const optionalPattern = /WARNING\s*-\s*(?:not_linked_optional|Les identifiants[^)]*optional)[^(]*\((?:column:\s*)?(\S+)\)[^\d]*(\d+)\s*(?:rows?|lignes?)/gi;
-    while ((m = optionalPattern.exec(fullText)) !== null) {
-      const col = m[1];
-      const count = parseInt(m[2]);
-      if (!optionalGroups[col]) optionalGroups[col] = [];
-      optionalGroups[col].push({ column: col, count, raw: m[0] });
-    }
-
-    // --- Incoherences ---
-    // Pattern: WARNING - incoherence: <category> - <N> rows
-    // Also: WARNING - Incohérence ... <category> ... <N> lignes
-    const incoherenceGroups: Record<string, any[]> = {};
-    const incoherencePattern = /WARNING\s*-\s*(?:incoherence|incoh[ée]rence)[:\s]*([^-\n]+?)\s*[-–]\s*(\d+)\s*(?:rows?|lignes?)/gi;
-    while ((m = incoherencePattern.exec(fullText)) !== null) {
-      const category = m[1].trim();
-      const count = parseInt(m[2]);
-      if (!incoherenceGroups[category]) incoherenceGroups[category] = [];
-      incoherenceGroups[category].push({ category, count, raw: m[0] });
-    }
-
-    // Also parse full rows from incoherence CSV-like output in logs
-    // Some loaders output JSON-formatted example rows after the warning
-    const incoherenceExamplePattern = /WARNING\s*-\s*(?:incoherence|incoh[ée]rence)\s+examples?\s+\((\w+)\):\s*(\[.*?\])/gi;
-    while ((m = incoherenceExamplePattern.exec(fullText)) !== null) {
-      const category = m[1];
-      try {
-        const examples = JSON.parse(m[2]);
-        if (!incoherenceGroups[category]) incoherenceGroups[category] = [];
-        incoherenceGroups[category].push(...examples.slice(0, 5));
-      } catch { /* ignore parse errors */ }
-    }
-
-    setNotLinkedMandatory(mandatoryGroups);
-    setNotLinkedOptional(optionalGroups);
-    setNotLinkedStatus(Object.keys(mandatoryGroups).length > 0 || Object.keys(optionalGroups).length > 0 ? "loaded" : "loaded");
-    setIncoherenceData(incoherenceGroups);
-    setIncoherenceStatus("loaded");
-  }, [taskLogs]);
 
   // DAG runner
   const linkedDags = useMemo(() => {
@@ -760,6 +714,83 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     if (!valueSearch) return columnValues.slice(0, 50);
     return columnValues.filter((v) => v.toLowerCase().includes(valueSearch.toLowerCase())).slice(0, 50);
   }, [columnValues, valueSearch]);
+
+  // Render a stage analysis card with preview table + "Analyser" button
+  const renderStageAnalysisCard = (title: string, stage: string, preview: StagePreview | null) => {
+    const stageLabel = STAGE_SHORT[stage] || stage;
+    return (
+      <div className="border border-gray-100 rounded-lg p-3">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <h4 className="text-xs font-semibold text-gray-700">{title}</h4>
+            <p className="text-[10px] text-gray-400 font-mono">{stageLabel}</p>
+          </div>
+          {preview && preview.rows.length > 0 && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-500">{preview.total} lignes</span>
+              <button
+                onClick={() => {
+                  if (!onAnalyzeExample || !selectedResource) return;
+                  // Launch full analysis with all resource blobs, using the first column as key
+                  const keyCol = preview.columns[0] || "";
+                  const firstVal = keyCol && preview.rows[0] ? String(preview.rows[0][keyCol] ?? "") : "";
+                  onAnalyzeExample(selectedResource, resourceBlobs.map((b) => b.name), keyCol, firstVal);
+                }}
+                className="text-xs bg-indigo-100 text-indigo-700 hover:bg-indigo-200 px-2 py-1 rounded transition-colors"
+              >
+                Analyser →
+              </button>
+            </div>
+          )}
+        </div>
+        {preview && preview.rows.length > 0 ? (
+          <div className="overflow-x-auto max-h-48 overflow-y-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr>
+                  {preview.columns.map((col) => (
+                    <th key={col} className="px-2 py-1 font-medium text-gray-500 whitespace-nowrap">{col}</th>
+                  ))}
+                  <th className="px-2 py-1"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {preview.rows.slice(0, 5).map((row, idx) => (
+                  <tr key={idx} className="border-t border-gray-100 hover:bg-gray-50">
+                    {preview.columns.map((col) => (
+                      <td key={col} className="px-2 py-1 text-gray-700 truncate max-w-[200px]" title={String(row[col] ?? "")}>
+                        {String(row[col] ?? "")}
+                      </td>
+                    ))}
+                    <td className="px-2 py-1">
+                      <button
+                        onClick={() => {
+                          if (!onAnalyzeExample || !selectedResource) return;
+                          // Analyze this specific row: pick a meaningful column as filter
+                          const keyCol = preview.columns[0] || "";
+                          const val = keyCol ? String(row[keyCol] ?? "") : "";
+                          onAnalyzeExample(selectedResource, resourceBlobs.map((b) => b.name), keyCol, val);
+                        }}
+                        className="text-[10px] text-indigo-500 hover:text-indigo-700 whitespace-nowrap"
+                      >
+                        Analyser
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : preview ? (
+          <p className="text-xs text-gray-400">Aucune donnée dans ce fichier.</p>
+        ) : analysisStatus === "loaded" ? (
+          <p className="text-xs text-gray-400">Aucun fichier trouvé pour cette étape.</p>
+        ) : (
+          <p className="text-xs text-gray-400">Cliquez sur Charger pour analyser.</p>
+        )}
+      </div>
+    );
+  };
 
   if (resources.length === 0) {
     return (
@@ -1320,101 +1351,41 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
 
         {/* Results Section: Analyse des raisons */}
         <div className="bg-white border border-gray-200 rounded-xl p-4">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Analyse des raisons</h3>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-semibold text-gray-700">Analyse des raisons</h3>
+            {analysisStatus === "idle" && (
+              <button
+                onClick={loadAnalysisPreviews}
+                disabled={resourceBlobs.length === 0}
+                className="text-xs text-indigo-600 hover:text-indigo-800 disabled:text-gray-400"
+              >
+                Charger
+              </button>
+            )}
+            {analysisStatus === "loading" && <span className="text-xs text-gray-400">Chargement...</span>}
+          </div>
 
-          <div className="space-y-4">
+          <div className="space-y-5">
             {/* Not linked mandatory */}
-            <div>
-              <h4 className="text-xs font-semibold text-gray-600 mb-2">Colonnes obligatoires non liées</h4>
-              {notLinkedStatus === "loading" ? (
-                <p className="text-xs text-gray-400">Loading...</p>
-              ) : Object.keys(notLinkedMandatory).length > 0 ? (
-                Object.entries(notLinkedMandatory).map(([column, rows]) => (
-                  <div key={column} className="mb-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs text-gray-700 font-mono">{column}</span>
-                      <button
-                        onClick={() => onAnalyzeExample && onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), column, (rows[0] as any)?.value || "")}
-                        className="text-xs text-indigo-600 hover:text-indigo-800"
-                      >
-                        Analyser →
-                      </button>
-                    </div>
-                    <div className="text-xs text-gray-600 bg-gray-50 rounded p-2 max-h-20 overflow-y-auto">
-                      {rows.slice(0, 5).map((row: any, idx) => (
-                        <div key={idx} className="truncate">{JSON.stringify(row)}</div>
-                      ))}
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <p className="text-xs text-gray-400">No data</p>
-              )}
-            </div>
+            {renderStageAnalysisCard(
+              "Not linked mandatory",
+              "compare_and_identify_not_linked_mandatory",
+              notLinkedMandatoryPreview,
+            )}
 
             {/* Not linked optional */}
-            <div>
-              <h4 className="text-xs font-semibold text-gray-600 mb-2">Colonnes optionnelles non liées</h4>
-              {Object.keys(notLinkedOptional).length > 0 ? (
-                Object.entries(notLinkedOptional).map(([column, rows]) => (
-                  <div key={column} className="mb-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs text-gray-700 font-mono">{column}</span>
-                      <button
-                        onClick={() => onAnalyzeExample && onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), column, (rows[0] as any)?.value || "")}
-                        className="text-xs text-indigo-600 hover:text-indigo-800"
-                      >
-                        Analyser →
-                      </button>
-                    </div>
-                    <div className="text-xs text-gray-600 bg-gray-50 rounded p-2 max-h-20 overflow-y-auto">
-                      {rows.slice(0, 5).map((row: any, idx) => (
-                        <div key={idx} className="truncate">{JSON.stringify(row)}</div>
-                      ))}
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <p className="text-xs text-gray-400">No data</p>
-              )}
-            </div>
+            {renderStageAnalysisCard(
+              "Not linked optional",
+              "compare_and_identify_not_linked_optional",
+              notLinkedOptionalPreview,
+            )}
 
             {/* Incohérences */}
-            <div>
-              <h4 className="text-xs font-semibold text-gray-600 mb-2">Incohérences</h4>
-              {incoherenceStatus === "loading" ? (
-                <p className="text-xs text-gray-400">Loading...</p>
-              ) : Object.keys(incoherenceData).length > 0 ? (
-                Object.entries(incoherenceData).map(([errorCol, rows]) => (
-                  <div key={errorCol} className="mb-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-xs text-gray-700 font-mono">{errorCol}</span>
-                      <button
-                        onClick={() => onAnalyzeExample && onAnalyzeExample(selectedResource!, resourceBlobs.map((b) => b.name), errorCol, "")}
-                        className="text-xs text-indigo-600 hover:text-indigo-800"
-                      >
-                        Analyser →
-                      </button>
-                    </div>
-                    <div className="text-xs text-gray-600 bg-gray-50 rounded p-2 max-h-32 overflow-y-auto">
-                      <table className="w-full text-left">
-                        <tbody>
-                          {rows.slice(0, 5).map((row: any, idx) => (
-                            <tr key={idx} className="border-b border-gray-200">
-                              {Object.entries(row).map(([key, val], colIdx) => (
-                                <td key={colIdx} className="px-2 py-1 truncate text-xs">{String(val)}</td>
-                              ))}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <p className="text-xs text-gray-400">No data</p>
-              )}
-            </div>
+            {renderStageAnalysisCard(
+              "Incohérences",
+              "clean_incoherent",
+              incoherencePreview,
+            )}
           </div>
         </div>
 
