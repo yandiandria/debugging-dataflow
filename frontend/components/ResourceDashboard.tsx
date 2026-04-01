@@ -87,7 +87,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
 
   // Data
   const [dags, setDags] = useState<DAG[]>([]);
-  const [dagConfig, setDagConfig] = useState<DAGConfig>({ container_name: "", environments: ["integration", "snap", "recette", "prod"] });
+  const [dagConfig, setDagConfig] = useState<DAGConfig>({ container_name: "docker-airflow-webserver-1", environments: ["integration", "snap", "recette", "prod"] });
   const [dagRuns, setDagRuns] = useState<DAGRun[]>([]);
   const [rules, setRules] = useState<IntegrationRule[]>([]);
   const [mappingIssues, setMappingIssues] = useState<MappingIssue[]>([]);
