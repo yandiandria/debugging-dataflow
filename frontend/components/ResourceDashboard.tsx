@@ -16,7 +16,6 @@ import {
   profileBlobsStream,
   getResourceBlobs,
   createDag,
-  getBlobPreview,
   getLatestAirflowRunId,
   getTaskStates,
   getRunningTaskLog,
@@ -27,14 +26,23 @@ const STAGE_SHORT: Record<string, string> = {
   transform: "Transformation",
   clean_cleaned: "Nettoyage (Clean)",
   clean_incoherent: "Nettoyage (Incohérent)",
-  compare_identify: "Comparaison & Identification",
+  compare_and_identify_in_flow_only: "In flow only",
+  compare_and_identify_in_flow_and_db_different: "In flow & DB different",
+  compare_and_identify_not_linked_mandatory: "Not linked mandatory",
+  compare_and_identify_not_linked_optional: "Not linked optional",
 };
 
+/** Pipeline display order: each inner array is rendered as a parallel row */
 const STAGE_ROWS: string[][] = [
   ["extract"],
   ["transform"],
   ["clean_cleaned", "clean_incoherent"],
-  ["compare_identify"],
+  [
+    "compare_and_identify_in_flow_only",
+    "compare_and_identify_in_flow_and_db_different",
+    "compare_and_identify_not_linked_mandatory",
+    "compare_and_identify_not_linked_optional",
+  ],
 ];
 
 type SectionKey = "config" | "logs" | "running";
@@ -116,6 +124,9 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
   const [notLinkedStatus, setNotLinkedStatus] = useState<LoadStatus>("idle");
   const [incoherenceData, setIncoherenceData] = useState<Record<string, any[]>>({});
   const [incoherenceStatus, setIncoherenceStatus] = useState<LoadStatus>("idle");
+
+  // Volumetry: expanded stage cards (for column profiling detail)
+  const [expandedStages, setExpandedStages] = useState<Set<string>>(new Set());
 
   // Tick elapsed time while a DAG is running
   useEffect(() => {
@@ -265,28 +276,25 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       .catch(() => setColumnValues([]));
   }, [selectedIdColumn, resourceBlobs, containerUrl]);
 
-  // Auto-select first linked DAG
-  useEffect(() => {
-    if (linkedDags.length > 0 && !selectedLinkedDagId) {
-      setSelectedLinkedDagId(linkedDags[0].id);
-    }
-  }, [linkedDags, selectedLinkedDagId]);
-
   // Watcher effect: poll task states every 2s when a run is active
   useEffect(() => {
     if (!currentRunId || !currentDagId) return;
 
+    if (!airflowConfig.base_url || !airflowConfig.username || !airflowConfig.password) return;
+
     watcherRef.current = setInterval(async () => {
       try {
-        const states = await getTaskStates(currentDagId, currentRunId);
-        setLiveTaskStates(states.task_states || {});
+        const states = await getTaskStates(airflowConfig, currentDagId, currentRunId);
+        const stateMap: Record<string, string> = {};
+        for (const s of states) stateMap[s.task_id] = s.state;
+        setLiveTaskStates(stateMap);
 
         // Find a running task
-        const running = Object.entries(states.task_states || {}).find(([, state]) => state === "running");
+        const running = states.find((s) => s.state === "running");
         if (running) {
-          setRunningTaskId(running[0]);
-          const logs = await getRunningTaskLog(currentDagId, currentRunId, running[0]);
-          setRunningTaskLogText(logs || "");
+          setRunningTaskId(running.task_id);
+          const logResult = await getRunningTaskLog(airflowConfig, currentDagId, currentRunId, running.task_id);
+          setRunningTaskLogText(logResult.logs || "");
           // Auto-open "running" section
           setOpenSections((prev) => new Set([...Array.from(prev), "running"]));
         } else {
@@ -301,20 +309,13 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     return () => {
       if (watcherRef.current) clearInterval(watcherRef.current);
     };
-  }, [currentRunId, currentDagId]);
+  }, [currentRunId, currentDagId, airflowConfig]);
 
-  // Analysis effect: load not-linked and incoherence analysis when resource blobs load
+  // Analysis effect: parse not-linked and incoherence data from task logs
   useEffect(() => {
-    if (resourceBlobs.length === 0) return;
-
-    (async () => {
-      // Run both analyses in parallel
-      await Promise.allSettled([
-        loadNotLinkedAnalysis(),
-        loadIncoherenceAnalysis(),
-      ]);
-    })();
-  }, [resourceBlobs, selectedResourceId]);
+    if (Object.keys(taskLogs).length === 0 && Object.keys(completedTaskStates).length === 0) return;
+    parseAnalysisFromLogs();
+  }, [taskLogs, completedTaskStates]);
 
   // Volumetry
   const handleRefreshVolumetry = async () => {
@@ -367,58 +368,98 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
     onTraceBatch(sorted.slice(batchStartIndex).map((b) => b.name));
   };
 
-  // Analysis: not-linked mandatory/optional columns
-  const loadNotLinkedAnalysis = useCallback(async () => {
-    if (resourceBlobs.length === 0) return;
-    setNotLinkedStatus("loading");
-    try {
-      const blobNames = resourceBlobs.map((b) => b.name);
-      // Call getBlobPreview for "extract" stage to get not-linked columns
-      const data = await getBlobPreview(containerUrl, blobNames, "extract");
-      // Group by column (you may need to adjust based on actual API response)
-      const grouped: Record<string, any[]> = {};
-      if (data && Array.isArray(data)) {
-        data.forEach((row: any) => {
-          const col = row.column || "unknown";
-          if (!grouped[col]) grouped[col] = [];
-          grouped[col].push(row);
-        });
+  // Parse not-linked (mandatory/optional) and incoherence data from loader task logs.
+  // Loader tasks emit lines like:
+  //   WARNING - not_linked_mandatory: employee not found (column: employee_id) - 42 rows
+  //   WARNING - not_linked_optional: medical_member not found (column: medical_member_id) - 12 rows
+  //   WARNING - incoherence: <category> - <count> rows
+  // We also look for reporting-style lines from the loader tasks.
+  const parseAnalysisFromLogs = useCallback(() => {
+    const allLogText: string[] = [];
+    for (const [, entries] of Object.entries(taskLogs)) {
+      for (const entry of entries) {
+        allLogText.push(entry.message);
       }
-      setNotLinkedMandatory(grouped);
-      setNotLinkedStatus("loaded");
-    } catch (e) {
-      setNotLinkedStatus("error");
     }
-  }, [resourceBlobs, containerUrl]);
+    const fullText = allLogText.join("\n");
 
-  // Analysis: incoherence data
-  const loadIncoherenceAnalysis = useCallback(async () => {
-    if (resourceBlobs.length === 0) return;
-    setIncoherenceStatus("loading");
-    try {
-      const blobNames = resourceBlobs.map((b) => b.name);
-      // Call getBlobPreview for "clean_incoherent" stage
-      const data = await getBlobPreview(containerUrl, blobNames, "clean_incoherent");
-      // Group by error_column
-      const grouped: Record<string, any[]> = {};
-      if (data && Array.isArray(data)) {
-        data.forEach((row: any) => {
-          const col = row.error_column || "unknown";
-          if (!grouped[col]) grouped[col] = [];
-          grouped[col].push(row);
-        });
-      }
-      setIncoherenceData(grouped);
-      setIncoherenceStatus("loaded");
-    } catch (e) {
-      setIncoherenceStatus("error");
+    // --- Not linked mandatory ---
+    // Pattern: WARNING - not_linked_mandatory: <reason> (column: <col>) - <N> rows
+    // Also matches: WARNING - Les identifiants ... ne sont pas liés (mandatory) ... column: <col>
+    const mandatoryGroups: Record<string, any[]> = {};
+    const mandatoryPattern = /WARNING\s*-\s*(?:not_linked_mandatory|Les identifiants[^)]*mandatory)[^(]*\((?:column:\s*)?(\S+)\)[^\d]*(\d+)\s*(?:rows?|lignes?)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = mandatoryPattern.exec(fullText)) !== null) {
+      const col = m[1];
+      const count = parseInt(m[2]);
+      if (!mandatoryGroups[col]) mandatoryGroups[col] = [];
+      mandatoryGroups[col].push({ column: col, count, raw: m[0] });
     }
-  }, [resourceBlobs, containerUrl]);
+    // Also try a more generic pattern for "employee not found", "medical member not found" etc.
+    const notFoundPattern = /WARNING\s*-\s*(\w[\w\s]*?)\s+not\s+found\s*\((?:column:\s*)?(\S+)\)[^\d]*(\d+)/gi;
+    while ((m = notFoundPattern.exec(fullText)) !== null) {
+      const reason = m[1].trim();
+      const col = m[2];
+      const count = parseInt(m[3]);
+      if (!mandatoryGroups[col]) mandatoryGroups[col] = [];
+      // Avoid duplicates
+      if (!mandatoryGroups[col].some((r: any) => r.reason === reason && r.count === count)) {
+        mandatoryGroups[col].push({ column: col, reason, count, raw: m[0] });
+      }
+    }
+
+    // --- Not linked optional ---
+    const optionalGroups: Record<string, any[]> = {};
+    const optionalPattern = /WARNING\s*-\s*(?:not_linked_optional|Les identifiants[^)]*optional)[^(]*\((?:column:\s*)?(\S+)\)[^\d]*(\d+)\s*(?:rows?|lignes?)/gi;
+    while ((m = optionalPattern.exec(fullText)) !== null) {
+      const col = m[1];
+      const count = parseInt(m[2]);
+      if (!optionalGroups[col]) optionalGroups[col] = [];
+      optionalGroups[col].push({ column: col, count, raw: m[0] });
+    }
+
+    // --- Incoherences ---
+    // Pattern: WARNING - incoherence: <category> - <N> rows
+    // Also: WARNING - Incohérence ... <category> ... <N> lignes
+    const incoherenceGroups: Record<string, any[]> = {};
+    const incoherencePattern = /WARNING\s*-\s*(?:incoherence|incoh[ée]rence)[:\s]*([^-\n]+?)\s*[-–]\s*(\d+)\s*(?:rows?|lignes?)/gi;
+    while ((m = incoherencePattern.exec(fullText)) !== null) {
+      const category = m[1].trim();
+      const count = parseInt(m[2]);
+      if (!incoherenceGroups[category]) incoherenceGroups[category] = [];
+      incoherenceGroups[category].push({ category, count, raw: m[0] });
+    }
+
+    // Also parse full rows from incoherence CSV-like output in logs
+    // Some loaders output JSON-formatted example rows after the warning
+    const incoherenceExamplePattern = /WARNING\s*-\s*(?:incoherence|incoh[ée]rence)\s+examples?\s+\((\w+)\):\s*(\[.*?\])/gi;
+    while ((m = incoherenceExamplePattern.exec(fullText)) !== null) {
+      const category = m[1];
+      try {
+        const examples = JSON.parse(m[2]);
+        if (!incoherenceGroups[category]) incoherenceGroups[category] = [];
+        incoherenceGroups[category].push(...examples.slice(0, 5));
+      } catch { /* ignore parse errors */ }
+    }
+
+    setNotLinkedMandatory(mandatoryGroups);
+    setNotLinkedOptional(optionalGroups);
+    setNotLinkedStatus(Object.keys(mandatoryGroups).length > 0 || Object.keys(optionalGroups).length > 0 ? "loaded" : "loaded");
+    setIncoherenceData(incoherenceGroups);
+    setIncoherenceStatus("loaded");
+  }, [taskLogs]);
 
   // DAG runner
   const linkedDags = useMemo(() => {
     return resourceDagIds.map((id) => dags.find((d) => d.id === id)).filter(Boolean) as DAG[];
   }, [resourceDagIds, dags]);
+
+  // Auto-select first linked DAG
+  useEffect(() => {
+    if (linkedDags.length > 0 && !selectedLinkedDagId) {
+      setSelectedLinkedDagId(linkedDags[0].id);
+    }
+  }, [linkedDags, selectedLinkedDagId]);
 
   const handleTriggerDag = async () => {
     const selectedDag = linkedDags.find((d) => d.id === selectedLinkedDagId);
@@ -525,7 +566,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       }
 
       // Get the latest run ID for this DAG
-      const runId = await getLatestAirflowRunId(selectedDag.dag_id, selectedEnv);
+      const runId = await getLatestAirflowRunId(selectedDag.dag_id);
       if (runId) {
         setCurrentRunId(runId);
         setCurrentDagId(selectedDag.dag_id);
@@ -684,6 +725,18 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       counts[stage] = (counts[stage] ?? 0) + p.row_count;
     }
     return counts;
+  }, [volEntry]);
+
+  // Profiles grouped by stage for detail cards
+  const profilesByStage = useMemo(() => {
+    if (!volEntry?.profiles) return {};
+    const grouped: Record<string, typeof volEntry.profiles> = {};
+    for (const p of volEntry.profiles) {
+      const stage = p.detected_stage;
+      if (!grouped[stage]) grouped[stage] = [];
+      grouped[stage].push(p);
+    }
+    return grouped;
   }, [volEntry]);
 
   const resourceRules = useMemo(() => {
@@ -1076,12 +1129,12 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
           </div>
         )}
 
-        {/* Results Section: Volumetry + Mapping Issues */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Volumetry */}
+        {/* Results Section: Volumetry pipeline + Mapping Issues */}
+        <div className="space-y-6">
+          {/* Volumetry pipeline cards */}
           <div className="bg-white border border-gray-200 rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-gray-700">Volumetry</h3>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-semibold text-gray-700">Volumétrie du DAG</h3>
               <button
                 onClick={handleRefreshVolumetry}
                 disabled={volEntry?.status === "loading"}
@@ -1096,24 +1149,100 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
               </p>
             )}
             {Object.keys(stageRowCounts).length > 0 ? (
-              <div className="space-y-2">
-                {Object.entries(stageRowCounts).sort(([a], [b]) => a.localeCompare(b)).map(([stage, count]) => (
-                  <div key={stage} className="flex items-center justify-between">
-                    <span className="text-sm text-gray-600">{stage}</span>
-                    <span className="text-sm font-mono font-medium text-gray-800">{count.toLocaleString()}</span>
-                  </div>
-                ))}
-                {Object.keys(stageRowCounts).length >= 2 && (
+              <div className="space-y-3">
+                {STAGE_ROWS.map((row, rowIdx) => {
+                  // Only show rows where at least one stage has data
+                  const activeStages = row.filter((s) => stageRowCounts[s] !== undefined);
+                  if (activeStages.length === 0) return null;
+                  return (
+                    <div key={rowIdx}>
+                      {rowIdx > 0 && (
+                        <div className="flex justify-center py-1">
+                          <span className="text-gray-300 text-xs">&#x25BC;</span>
+                        </div>
+                      )}
+                      <div className={`grid gap-3 ${activeStages.length > 1 ? `grid-cols-${Math.min(activeStages.length, 4)}` : "grid-cols-1"}`}
+                        style={activeStages.length > 1 ? { gridTemplateColumns: `repeat(${activeStages.length}, minmax(0, 1fr))` } : undefined}
+                      >
+                        {activeStages.map((stage) => {
+                          const count = stageRowCounts[stage] ?? 0;
+                          const label = STAGE_SHORT[stage] || stage;
+                          const isExpanded = expandedStages.has(stage);
+                          const profiles = profilesByStage[stage] ?? [];
+                          return (
+                            <div key={stage} className="border border-gray-200 rounded-lg p-3 bg-gray-50">
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="text-xs font-semibold text-gray-700">{label}</span>
+                                <span className="text-sm font-mono font-bold text-gray-900">{count.toLocaleString()}</span>
+                              </div>
+                              <p className="text-[10px] text-gray-400 font-mono mb-1">{stage}</p>
+                              {profiles.length > 0 && profiles[0].columns?.length > 0 && (
+                                <button
+                                  onClick={() => setExpandedStages((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(stage)) next.delete(stage); else next.add(stage);
+                                    return next;
+                                  })}
+                                  className="text-[10px] text-indigo-500 hover:text-indigo-700 mt-1"
+                                >
+                                  {isExpanded ? "Masquer le profiling ▲" : "Détail du profiling ▼"}
+                                </button>
+                              )}
+                              {isExpanded && profiles.map((p) => (
+                                <div key={p.blob_name} className="mt-2 text-[10px] text-gray-500 space-y-1 border-t border-gray-200 pt-2">
+                                  <p className="font-mono truncate" title={p.blob_name}>{p.blob_name.split("/").pop()}</p>
+                                  <div className="space-y-0.5">
+                                    {p.columns.map((col) => (
+                                      <div key={col.name} className="flex items-center justify-between">
+                                        <span className="font-mono">{col.name}</span>
+                                        <span className="text-gray-400">{col.distinct_count} distinct</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+                {/* Show stages not in STAGE_ROWS (catch-all) */}
+                {(() => {
+                  const knownStages = new Set(STAGE_ROWS.flat());
+                  const unknownStages = Object.keys(stageRowCounts).filter((s) => !knownStages.has(s));
+                  if (unknownStages.length === 0) return null;
+                  return (
+                    <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${Math.min(unknownStages.length, 4)}, minmax(0, 1fr))` }}>
+                      {unknownStages.map((stage) => (
+                        <div key={stage} className="border border-gray-200 rounded-lg p-3 bg-gray-50">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-semibold text-gray-700">{STAGE_SHORT[stage] || stage}</span>
+                            <span className="text-sm font-mono font-bold text-gray-900">{(stageRowCounts[stage] ?? 0).toLocaleString()}</span>
+                          </div>
+                          <p className="text-[10px] text-gray-400 font-mono">{stage}</p>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+                {/* Drop rate summary */}
+                {stageRowCounts["extract"] != null && Object.keys(stageRowCounts).length >= 2 && (
                   <div className="pt-2 border-t border-gray-100">
                     <div className="flex items-center justify-between text-xs text-gray-500">
-                      <span>Drop rate (extract &rarr; last)</span>
+                      <span>Drop rate (extract &rarr; dernière étape)</span>
                       <span>
                         {(() => {
-                          const vals = Object.values(stageRowCounts);
-                          const first = vals[0];
-                          const last = vals[vals.length - 1];
+                          const first = stageRowCounts["extract"];
+                          // Find the last stage in pipeline order that has data
+                          const allStages = STAGE_ROWS.flat();
+                          let lastCount = first;
+                          for (const s of allStages) {
+                            if (stageRowCounts[s] !== undefined) lastCount = stageRowCounts[s];
+                          }
                           if (first === 0) return "N/A";
-                          return ((1 - last / first) * 100).toFixed(1) + "%";
+                          return ((1 - lastCount / first) * 100).toFixed(1) + "%";
                         })()}
                       </span>
                     </div>
