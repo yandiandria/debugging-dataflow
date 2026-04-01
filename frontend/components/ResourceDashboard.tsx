@@ -716,8 +716,27 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
   }, [columnValues, valueSearch]);
 
   // Render a stage analysis card with preview table + "Analyser" button
-  const renderStageAnalysisCard = (title: string, stage: string, preview: StagePreview | null) => {
+  // When withCauseAnalysis=true and the data has a 'reason' column, rows are grouped
+  // by cause so each distinct reason shows up to 5 example rows.
+  const renderStageAnalysisCard = (title: string, stage: string, preview: StagePreview | null, withCauseAnalysis = false) => {
     const stageLabel = STAGE_SHORT[stage] || stage;
+
+    // Build cause groups when applicable
+    const causeGroups: { reason: string; rows: Record<string, unknown>[] }[] | null =
+      withCauseAnalysis && preview && preview.columns.includes("reason")
+        ? (() => {
+            const map = new Map<string, Record<string, unknown>[]>();
+            for (const row of preview.rows) {
+              const key = String(row["reason"] ?? "");
+              if (!map.has(key)) map.set(key, []);
+              map.get(key)!.push(row);
+            }
+            return Array.from(map.entries())
+              .sort((a, b) => b[1].length - a[1].length)
+              .map(([reason, rows]) => ({ reason, rows }));
+          })()
+        : null;
+
     return (
       <div className="border border-gray-100 rounded-lg p-3">
         <div className="flex items-center justify-between mb-2">
@@ -744,43 +763,103 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
           )}
         </div>
         {preview && preview.rows.length > 0 ? (
-          <div className="overflow-x-auto max-h-48 overflow-y-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-gray-50 sticky top-0">
-                <tr>
-                  {preview.columns.map((col) => (
-                    <th key={col} className="px-2 py-1 font-medium text-gray-500 whitespace-nowrap">{col}</th>
-                  ))}
-                  <th className="px-2 py-1"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {preview.rows.slice(0, 5).map((row, idx) => (
-                  <tr key={idx} className="border-t border-gray-100 hover:bg-gray-50">
+          causeGroups ? (
+            // ── Cause-analysis view: one section per distinct reason ──
+            <div className="space-y-3">
+              {causeGroups.map(({ reason, rows }) => {
+                const displayCols = preview.columns.filter((c) => c !== "reason");
+                return (
+                  <div key={reason} className="border border-gray-100 rounded-md overflow-hidden">
+                    {/* Cause header */}
+                    <div className="flex items-center gap-2 px-2 py-1.5 bg-gray-50 border-b border-gray-100">
+                      <span className="text-xs font-medium text-gray-700 flex-1 truncate" title={reason}>
+                        {reason || "—"}
+                      </span>
+                      <span className="text-[10px] text-gray-400 tabular-nums flex-shrink-0">
+                        {rows.length} row{rows.length !== 1 ? "s" : ""}
+                      </span>
+                    </div>
+                    {/* Up to 5 example rows */}
+                    <div className="overflow-x-auto max-h-36 overflow-y-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-gray-50 sticky top-0">
+                          <tr>
+                            {displayCols.map((col) => (
+                              <th key={col} className="px-2 py-1 font-medium text-gray-500 whitespace-nowrap">{col}</th>
+                            ))}
+                            <th className="px-2 py-1"></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rows.slice(0, 5).map((row, idx) => (
+                            <tr key={idx} className="border-t border-gray-100 hover:bg-gray-50">
+                              {displayCols.map((col) => (
+                                <td key={col} className="px-2 py-1 text-gray-700 truncate max-w-[200px]" title={String(row[col] ?? "")}>
+                                  {String(row[col] ?? "")}
+                                </td>
+                              ))}
+                              <td className="px-2 py-1">
+                                <button
+                                  onClick={() => {
+                                    if (!onAnalyzeExample || !selectedResource) return;
+                                    const keyCol = preview.columns[0] || "";
+                                    const val = keyCol ? String(row[keyCol] ?? "") : "";
+                                    onAnalyzeExample(selectedResource, resourceBlobs.map((b) => b.name), keyCol, val);
+                                  }}
+                                  className="text-[10px] text-indigo-500 hover:text-indigo-700 whitespace-nowrap"
+                                >
+                                  Analyser
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            // ── Flat table view (default) ──
+            <div className="overflow-x-auto max-h-48 overflow-y-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-gray-50 sticky top-0">
+                  <tr>
                     {preview.columns.map((col) => (
-                      <td key={col} className="px-2 py-1 text-gray-700 truncate max-w-[200px]" title={String(row[col] ?? "")}>
-                        {String(row[col] ?? "")}
-                      </td>
+                      <th key={col} className="px-2 py-1 font-medium text-gray-500 whitespace-nowrap">{col}</th>
                     ))}
-                    <td className="px-2 py-1">
-                      <button
-                        onClick={() => {
-                          if (!onAnalyzeExample || !selectedResource) return;
-                          // Analyze this specific row: pick a meaningful column as filter
-                          const keyCol = preview.columns[0] || "";
-                          const val = keyCol ? String(row[keyCol] ?? "") : "";
-                          onAnalyzeExample(selectedResource, resourceBlobs.map((b) => b.name), keyCol, val);
-                        }}
-                        className="text-[10px] text-indigo-500 hover:text-indigo-700 whitespace-nowrap"
-                      >
-                        Analyser
-                      </button>
-                    </td>
+                    <th className="px-2 py-1"></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {preview.rows.slice(0, 5).map((row, idx) => (
+                    <tr key={idx} className="border-t border-gray-100 hover:bg-gray-50">
+                      {preview.columns.map((col) => (
+                        <td key={col} className="px-2 py-1 text-gray-700 truncate max-w-[200px]" title={String(row[col] ?? "")}>
+                          {String(row[col] ?? "")}
+                        </td>
+                      ))}
+                      <td className="px-2 py-1">
+                        <button
+                          onClick={() => {
+                            if (!onAnalyzeExample || !selectedResource) return;
+                            // Analyze this specific row: pick a meaningful column as filter
+                            const keyCol = preview.columns[0] || "";
+                            const val = keyCol ? String(row[keyCol] ?? "") : "";
+                            onAnalyzeExample(selectedResource, resourceBlobs.map((b) => b.name), keyCol, val);
+                          }}
+                          className="text-[10px] text-indigo-500 hover:text-indigo-700 whitespace-nowrap"
+                        >
+                          Analyser
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
         ) : preview ? (
           <p className="text-xs text-gray-400">Aucune donnée dans ce fichier.</p>
         ) : analysisStatus === "loaded" ? (
@@ -1371,6 +1450,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
               "Not linked mandatory",
               "compare_and_identify_not_linked_mandatory",
               notLinkedMandatoryPreview,
+              true,
             )}
 
             {/* Not linked optional */}
@@ -1378,6 +1458,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
               "Not linked optional",
               "compare_and_identify_not_linked_optional",
               notLinkedOptionalPreview,
+              true,
             )}
 
             {/* Incohérences */}
