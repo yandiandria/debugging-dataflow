@@ -78,14 +78,6 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-# ── In-memory caches ───────────────────────────────────────────────────────────
-
-# Cache for `airflow dags list` — avoids a costly docker exec on every page load.
-# TTL: 5 minutes.  Invalidated by POST /api/dags/list-airflow?force_refresh=true.
-_airflow_dags_cache: Optional[Dict] = None
-_AIRFLOW_DAGS_CACHE_TTL = 300  # seconds
-
-
 # ── Persistence helpers ─────────────────────────────────────────────────────────
 
 # DATA_DIR can be overridden via the DATAFLOW_DATA_DIR environment variable so
@@ -1012,59 +1004,6 @@ async def get_running_task_log(body: RunningTaskLogRequest):
     return {"task_id": body.task_id, "logs": result.get("logs", "")}
 
 
-@app.post("/api/dags/list-airflow")
-async def list_airflow_dags(force_refresh: bool = False):
-    """List DAGs from airflow CLI with in-memory TTL cache (5 min).
-
-    Pass ?force_refresh=true to bypass the cache and re-query Airflow.
-    The response includes `cached` (bool) and `fetched_at` (ISO timestamp)
-    so the frontend can show how fresh the data is.
-    """
-    global _airflow_dags_cache
-
-    now = time.monotonic()
-    if (
-        not force_refresh
-        and _airflow_dags_cache is not None
-        and now - _airflow_dags_cache["fetched_at_mono"] < _AIRFLOW_DAGS_CACHE_TTL
-    ):
-        return {**_airflow_dags_cache["payload"], "cached": True}
-
-    config = _load_dag_config()
-    container = config.get("container_name", "")
-    if not container:
-        raise HTTPException(status_code=400, detail="Docker container name not configured.")
-
-    cmd = ["docker", "exec", container, "airflow", "dags", "list", "-o", "json"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise HTTPException(status_code=504, detail="Timeout listing DAGs from Airflow")
-
-        if proc.returncode != 0:
-            raise HTTPException(status_code=500, detail=stderr.decode() or "Failed to list DAGs")
-
-        fetched_at_iso = datetime.now(timezone.utc).isoformat()
-        try:
-            dags = json.loads(stdout.decode())
-        except json.JSONDecodeError:
-            dags = []
-
-        payload = {"dags": dags, "fetched_at": fetched_at_iso}
-        _airflow_dags_cache = {"payload": payload, "fetched_at_mono": now}
-        return {**payload, "cached": False}
-
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="Docker not found")
-
-
 # ── DAG run history ───────────────────────────────────────────────────────────
 
 _LOG_KEYS = {"task_logs", "task_sub_logs", "stdout", "stderr"}
@@ -1113,39 +1052,39 @@ async def update_dag_run(run_id: str, body: Dict):
     raise HTTPException(status_code=404, detail="Run not found")
 
 
-@app.get("/api/dags/{dag_id}/latest-run-id")
-async def get_latest_airflow_run_id(dag_id: str):
-    """Return the most recent run_id for dag_id by querying Airflow directly."""
-    config = _load_dag_config()
-    container = config.get("container_name", "")
-    if not container:
-        raise HTTPException(status_code=400, detail="Docker container name not configured.")
+class LatestRunIdRequest(BaseModel):
+    base_url: str
+    username: str
+    password: str
+    verify_tls: bool = True
 
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", container,
-        "airflow", "dags", "list-runs", "-d", dag_id, "--output", "json",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await proc.communicate()
 
-    runs: List[Dict] = []
-    for line in stdout.decode().strip().split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("["):
-            try:
-                parsed = json.loads(stripped)
-                if isinstance(parsed, list):
-                    runs = parsed
-                    break
-            except json.JSONDecodeError:
-                pass
+@app.post("/api/dags/{dag_id}/latest-run-id")
+async def get_latest_airflow_run_id(dag_id: str, body: LatestRunIdRequest):
+    """Return the most recent run_id for dag_id via the Airflow REST API."""
+    credentials = f"{body.username}:{body.password}"
+    auth_header = f"Basic {base64.b64encode(credentials.encode()).decode()}"
+    base_url = body.base_url.rstrip("/")
+    dag_id_encoded = quote(dag_id, safe="")
 
-    if not runs:
+    async with httpx.AsyncClient(verify=body.verify_tls, timeout=15.0) as client:
+        try:
+            resp = await client.get(
+                f"{base_url}/api/v1/dags/{dag_id_encoded}/dagRuns",
+                params={"limit": "1", "order_by": "-execution_date"},
+                headers={"Authorization": auth_header},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    dag_runs = resp.json().get("dag_runs", [])
+    if not dag_runs:
         raise HTTPException(status_code=404, detail="No runs found for this DAG.")
 
-    latest = sorted(runs, key=lambda r: r.get("execution_date", ""), reverse=True)[0]
-    run_id = latest.get("run_id", "")
+    run_id = dag_runs[0].get("dag_run_id", "")
     if not run_id:
         raise HTTPException(status_code=404, detail="Could not determine run_id.")
 

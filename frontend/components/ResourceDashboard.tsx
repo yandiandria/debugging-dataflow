@@ -528,7 +528,7 @@ export default function ResourceDashboard({ resources, containerUrl, onBack, onA
       }
 
       // Get the latest run ID for this DAG
-      const runId = await getLatestAirflowRunId(selectedDag.dag_id);
+      const runId = await getLatestAirflowRunId(airflowConfig, selectedDag.dag_id);
       if (runId) {
         setCurrentRunId(runId);
         setCurrentDagId(selectedDag.dag_id);

@@ -3,57 +3,10 @@ import type { DAG, DAGConfig, DockerContainer } from "../lib/api";
 import {
   getDags, createDag, updateDag, deleteDag,
   getDagConfig, updateDagConfig,
-  listAirflowDags, listDockerContainers,
+  listDockerContainers,
   exportConfig, importConfig,
 } from "../lib/api";
 
-function DagIdInput({
-  value,
-  onChange,
-  suggestions,
-  className,
-  placeholder = "airflow_dag_id",
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  suggestions: string[];
-  className?: string;
-  placeholder?: string;
-}) {
-  const [open, setOpen] = useState(false);
-
-  const filtered = suggestions.filter(
-    (id) => id.toLowerCase().includes(value.toLowerCase()) && id !== value
-  );
-
-  return (
-    <div className="relative">
-      <input
-        type="text"
-        value={value}
-        placeholder={placeholder}
-        onChange={(e) => { onChange(e.target.value); setOpen(true); }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
-        className={className}
-      />
-      {open && filtered.length > 0 && (
-        <ul className="absolute z-20 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto">
-          {filtered.map((id) => (
-            <li
-              key={id}
-              onMouseDown={() => { onChange(id); setOpen(false); }}
-              className="px-3 py-1.5 text-sm font-mono cursor-pointer hover:bg-indigo-50 hover:text-indigo-700 truncate"
-              title={id}
-            >
-              {id}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
 
 interface Props {
   onBack: () => void;
@@ -83,32 +36,10 @@ export default function DAGManager({ onBack }: Props) {
   const [dockerContainers, setDockerContainers] = useState<DockerContainer[]>([]);
   const [dockerLoading, setDockerLoading] = useState(false);
 
-  // Airflow DAG autocomplete
-  const [airflowDags, setAirflowDags] = useState<string[]>([]);
-  const [airflowDagsLoading, setAirflowDagsLoading] = useState(false);
-  const [airflowDagsFetchedAt, setAirflowDagsFetchedAt] = useState<Date | null>(null);
-  const [airflowDagsCached, setAirflowDagsCached] = useState(false);
-  const [airflowDagsError, setAirflowDagsError] = useState<string | null>(null);
-
   // Export / import
   const [importing, setImporting] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
-
-  const fetchAirflowDags = useCallback(async (forceRefresh = false) => {
-    setAirflowDagsLoading(true);
-    setAirflowDagsError(null);
-    try {
-      const result = await listAirflowDags(forceRefresh);
-      setAirflowDags(result.dags.map((d) => d.dag_id ?? "").filter(Boolean));
-      setAirflowDagsFetchedAt(new Date(result.fetched_at));
-      setAirflowDagsCached(result.cached);
-    } catch (e: unknown) {
-      setAirflowDagsError(e instanceof Error ? e.message : "Airflow unreachable");
-    } finally {
-      setAirflowDagsLoading(false);
-    }
-  }, []);
 
   const fetchDockerContainers = useCallback(async () => {
     setDockerLoading(true);
@@ -123,8 +54,7 @@ export default function DAGManager({ onBack }: Props) {
   useEffect(() => {
     getDags().then(setDags).catch(() => {});
     getDagConfig().then((c) => setConfig(c)).catch(() => {});
-    fetchAirflowDags();
-  }, [fetchAirflowDags]);
+  }, []);
 
   const handleCreate = async () => {
     if (!newDagId.trim() || !newDisplayName.trim()) return;
@@ -382,31 +312,7 @@ export default function DAGManager({ onBack }: Props) {
         <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
           <div className="grid grid-cols-[1fr_1fr_auto] gap-4 px-4 py-2.5 bg-gray-50 border-b border-gray-200 text-xs font-medium text-gray-500 items-center">
             <span>Display name</span>
-            <div className="flex items-center gap-2">
-              <span>Airflow DAG ID</span>
-              {/* Autocomplete source status */}
-              <span className="font-normal">
-                {airflowDagsLoading ? (
-                  <span className="text-gray-400 animate-pulse">fetching suggestions…</span>
-                ) : airflowDagsError ? (
-                  <span className="text-amber-500">
-                    container unreachable ·{" "}
-                    <button onClick={() => fetchAirflowDags(true)} className="underline hover:text-amber-700">retry</button>
-                    {" · "}type DAG ID manually
-                  </span>
-                ) : airflowDagsFetchedAt ? (
-                  <span className="text-gray-400">
-                    {airflowDagsCached ? "cached · " : ""}
-                    {airflowDags.length} suggestions ·{" "}
-                    <button onClick={() => fetchAirflowDags(true)} className="underline hover:text-indigo-600">refresh</button>
-                  </span>
-                ) : (
-                  <button onClick={() => fetchAirflowDags(true)} className="text-gray-400 underline hover:text-indigo-600">
-                    load suggestions
-                  </button>
-                )}
-              </span>
-            </div>
+            <span>Airflow DAG ID</span>
             <span>Actions</span>
           </div>
 
@@ -420,10 +326,11 @@ export default function DAGManager({ onBack }: Props) {
                 autoFocus
                 className="border border-indigo-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
               />
-              <DagIdInput
+              <input
+                type="text"
+                placeholder="airflow_dag_id"
                 value={newDagId}
-                onChange={setNewDagId}
-                suggestions={airflowDags}
+                onChange={(e) => setNewDagId(e.target.value)}
                 className="border border-indigo-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400 w-full"
               />
               <div className="flex gap-2">
@@ -465,10 +372,11 @@ export default function DAGManager({ onBack }: Props) {
                       autoFocus
                       className="border border-blue-300 rounded-lg px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
                     />
-                    <DagIdInput
+                    <input
+                      type="text"
+                      placeholder="airflow_dag_id"
                       value={editState.dag_id}
-                      onChange={(v) => setEditState({ ...editState, dag_id: v })}
-                      suggestions={airflowDags}
+                      onChange={(e) => setEditState({ ...editState, dag_id: e.target.value })}
                       className="border border-blue-300 rounded-lg px-2 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400 w-full"
                     />
                     <div className="flex gap-2">

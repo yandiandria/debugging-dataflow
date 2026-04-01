@@ -507,28 +507,6 @@ export async function updateDagConfig(config: DAGConfig): Promise<DAGConfig> {
   return res.json();
 }
 
-export interface AirflowDagsResult {
-  dags: { dag_id?: string }[];
-  fetched_at: string; // ISO timestamp
-  cached: boolean;
-}
-
-export async function listAirflowDags(forceRefresh = false): Promise<AirflowDagsResult> {
-  const url = `${BASE_URL}/api/dags/list-airflow${forceRefresh ? "?force_refresh=true" : ""}`;
-  const res = await fetch(url, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to list Airflow DAGs");
-  const data = await res.json();
-  // Handle both old (plain array) and new (wrapped object) response shapes
-  if (Array.isArray(data)) {
-    return { dags: data, fetched_at: new Date().toISOString(), cached: false };
-  }
-  return {
-    dags: Array.isArray(data.dags) ? data.dags : [],
-    fetched_at: data.fetched_at ?? new Date().toISOString(),
-    cached: data.cached ?? false,
-  };
-}
-
 // ── Docker helpers ──────────────────────────────────────────────────────────
 
 export interface DockerContainer {
@@ -616,8 +594,17 @@ export async function triggerDagStream(
   }
 }
 
-export async function getLatestAirflowRunId(dagId: string): Promise<string> {
-  const res = await fetch(`${BASE_URL}/api/dags/${encodeURIComponent(dagId)}/latest-run-id`);
+export async function getLatestAirflowRunId(config: AirflowConfig, dagId: string): Promise<string> {
+  const res = await fetch(`${BASE_URL}/api/dags/${encodeURIComponent(dagId)}/latest-run-id`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      base_url: config.base_url,
+      username: config.username,
+      password: config.password,
+      verify_tls: config.verify_tls,
+    }),
+  });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || "Failed to get latest run ID");
