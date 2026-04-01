@@ -1570,6 +1570,52 @@ async def preview_blob(request: PreviewRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class CauseSummaryRequest(BaseModel):
+    container_url: str
+    blob_name: str
+    reason_column: str = "reason"
+    example_count: int = 5
+
+
+@app.post("/api/blobs/cause-summary")
+async def cause_summary(request: CauseSummaryRequest):
+    """Read the full blob, group by reason_column, and return per-cause counts + example rows.
+    Falls back to local cache when available so repeated calls are fast."""
+    try:
+        cache_path = _blob_cache_path(request.container_url, request.blob_name)
+        if cache_path.exists():
+            df = pl.read_csv(cache_path, infer_schema_length=100)
+        else:
+            client = build_container_client(request.container_url)
+            blob_client = client.get_blob_client(request.blob_name)
+            raw = await asyncio.to_thread(
+                lambda: blob_client.download_blob().readall()
+            )
+            df = pl.read_csv(io.BytesIO(raw), infer_schema_length=100)
+
+        total = len(df)
+        other_cols = [c for c in df.columns if c != request.reason_column]
+
+        if request.reason_column not in df.columns:
+            return {"causes": [], "total": total, "columns": other_cols, "has_reason": False}
+
+        causes = []
+        for (reason_val,), group in df.group_by(request.reason_column, maintain_order=False):
+            examples = group.head(request.example_count).to_dicts()
+            causes.append({
+                "reason": str(reason_val) if reason_val is not None else "",
+                "count": len(group),
+                "examples": examples,
+            })
+
+        causes.sort(key=lambda x: x["count"], reverse=True)
+        return {"causes": causes, "total": total, "columns": other_cols, "has_reason": True}
+    except AzureError as e:
+        raise HTTPException(status_code=400, detail=f"Azure error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _profile_one_blob_sync(blob_client, blob_name: str) -> dict:
     """Download and profile a single blob. Runs synchronously — call via asyncio.to_thread."""
     raw = blob_client.download_blob().readall()

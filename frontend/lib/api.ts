@@ -241,6 +241,35 @@ export async function getBlobPreview(
   return res.json();
 }
 
+export interface CauseGroup {
+  reason: string;
+  count: number;
+  examples: Record<string, unknown>[];
+}
+
+export interface CauseSummary {
+  causes: CauseGroup[];
+  total: number;
+  columns: string[];
+  has_reason: boolean;
+}
+
+export async function getCauseSummary(
+  containerUrl: string,
+  blobName: string,
+): Promise<CauseSummary> {
+  const res = await fetch(`${BASE_URL}/api/blobs/cause-summary`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ container_url: containerUrl, blob_name: blobName }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Failed to load cause summary");
+  }
+  return res.json();
+}
+
 export async function getBlobColumns(
   containerUrl: string,
   blobName: string
